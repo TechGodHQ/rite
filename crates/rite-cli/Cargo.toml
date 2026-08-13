@@ -1,0 +1,19 @@
+[package]
+name = "rite-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rite"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+rite-server = { path = "../rite-server" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

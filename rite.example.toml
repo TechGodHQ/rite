@@ -1,0 +1,5 @@
+[[rites]]
+name = "github-pr-opened"
+source = "github"
+match = { event_type = "pull_request", action = "opened" }
+action = { type = "http_post", url = "https://example.test/hooks/pr" }

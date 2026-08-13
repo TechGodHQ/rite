@@ -1,0 +1,8 @@
+pre-commit:
+  commands:
+    fmt:
+      run: cargo fmt --all -- --check
+    test:
+      run: cargo test --all-targets
+    gitleaks:
+      run: gitleaks protect --staged --redact
