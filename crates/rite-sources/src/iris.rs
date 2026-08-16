@@ -103,7 +103,7 @@ impl IrisSource {
                 Err(error) => tracing::warn!(%error, "Iris SSE connection failed; reconnecting"),
             }
             tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(60));
+            delay = (delay * 2).min(Duration::from_mins(1));
         }
     }
 
