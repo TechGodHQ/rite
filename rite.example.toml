@@ -3,3 +3,13 @@ name = "github-pr-opened"
 source = "github"
 match = { event_type = "pull_request", action = "opened" }
 action = { type = "http_post", url = "https://example.test/hooks/pr" }
+
+[sources.iris]
+enabled = true
+base_url = "http://127.0.0.1:3000"
+
+[[rites]]
+name = "urgent-telegram"
+source = "iris"
+match = { provider = "telegram", body_contains = "URGENT" }
+action = { type = "http_post", url = "https://example.test/hooks/urgent" }

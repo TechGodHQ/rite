@@ -19,6 +19,10 @@ name = "github-pr-opened"
 source = "github"
 match = { event_type = "pull_request", action = "opened" }
 action = { type = "http_post", url = "https://example.test/hooks/pr" }
+
+[sources.iris]
+enabled = true
+base_url = "http://127.0.0.1:3000"
 ```
 
 Run it:
@@ -32,6 +36,12 @@ Endpoints:
 - `GET /health` — returns `ok`
 - `GET /sources` — configured source adapters
 - `POST /event/github` — authenticated GitHub webhook ingress using `X-Hub-Signature-256`
+
+When enabled, the Iris source subscribes to `GET /v1/events` in the background. It reconnects
+with exponential backoff (1–60 seconds), so Rite remains healthy while Iris is unavailable.
+Iris messages become `source = "iris"` events. `event_type` is the Iris message kind and metadata
+contains `provider`, `source_id`, `sender`, `kind`, `iris_metadata`, and the complete original
+Iris message under `message` for future matching needs.
 
 ## Development
 

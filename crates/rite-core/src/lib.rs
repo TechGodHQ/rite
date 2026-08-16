@@ -147,6 +147,13 @@ impl RiteHandler {
                         .matches_json(&Value::String(event.action.clone().unwrap_or_default())),
                     "severity" => serde_json::to_value(event.severity)
                         .is_ok_and(|value| expected.matches_json(&value)),
+                    "body_contains" => match expected {
+                        MatchValue::String(needle) => event
+                            .body
+                            .as_ref()
+                            .is_some_and(|body| body.contains(needle)),
+                        _ => false,
+                    },
                     key => event
                         .metadata
                         .get(key)
@@ -181,6 +188,28 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
                 ("number".into(), Value::from(4)),
                 ("draft".into(), Value::Bool(false)),
             ]),
+        };
+        assert!(handler.matches(&event));
+    }
+
+    #[test]
+    fn handler_matches_body_substring() {
+        let handler: RiteHandler = toml::from_str(
+            r#"name = "urgent"
+source = "iris"
+match = { body_contains = "URGENT" }
+action = { type = "http_post", url = "https://example.test/hook" }"#,
+        )
+        .expect("handler parses");
+        let event = RiteEvent {
+            source: "iris".into(),
+            event_type: "text".into(),
+            action: None,
+            timestamp: Utc::now(),
+            severity: Severity::Info,
+            title: "message".into(),
+            body: Some("URGENT: deploy".into()),
+            metadata: BTreeMap::new(),
         };
         assert!(handler.matches(&event));
     }
