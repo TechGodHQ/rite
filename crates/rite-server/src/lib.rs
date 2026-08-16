@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use rite_core::{EventSource, RiteAction, RiteHandler};
-use rite_sources::github::GitHubSource;
+use rite_sources::{github::GitHubSource, iris::IrisSource};
 use serde::{Deserialize, Serialize};
 
 /// Server configuration loaded from TOML.
@@ -18,6 +18,23 @@ use serde::{Deserialize, Serialize};
 pub struct RiteConfig {
     #[serde(default)]
     pub rites: Vec<RiteHandler>,
+    #[serde(default)]
+    pub sources: SourcesConfig,
+}
+
+/// Source configuration loaded from TOML.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SourcesConfig {
+    /// Optional Iris SSE subscription source.
+    pub iris: Option<IrisConfig>,
+}
+
+/// Iris subscription configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IrisConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub base_url: String,
 }
 
 /// Shared HTTP application state.
@@ -26,6 +43,7 @@ pub struct AppState {
     pub handlers: Arc<Vec<RiteHandler>>,
     pub github: Arc<GitHubSource>,
     pub client: reqwest::Client,
+    pub iris: Option<IrisSource>,
 }
 
 /// Creates the Rite HTTP application.
@@ -54,10 +72,18 @@ struct SourceResponse {
 
 async fn sources(State(state): State<AppState>) -> Json<Vec<SourceResponse>> {
     let metadata = state.github.metadata();
-    Json(vec![SourceResponse {
+    let mut sources = vec![SourceResponse {
         id: metadata.id,
         name: metadata.name,
-    }])
+    }];
+    if let Some(iris) = &state.iris {
+        let metadata = iris.metadata();
+        sources.push(SourceResponse {
+            id: metadata.id,
+            name: metadata.name,
+        });
+    }
+    Json(sources)
 }
 
 async fn receive_event(
@@ -119,11 +145,47 @@ async fn receive_event(
 
 /// Builds state with a GitHub source and TOML-configured handlers.
 pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<AppState> {
+    let iris = config
+        .sources
+        .iris
+        .filter(|config| config.enabled)
+        .map(|config| IrisSource::new(config.base_url))
+        .transpose()?;
     Ok(AppState {
         handlers: Arc::new(config.rites),
         github: Arc::new(GitHubSource::new(secret)?),
         client: reqwest::Client::new(),
+        iris,
     })
+}
+
+/// Starts the configured Iris subscription without preventing the HTTP server from starting.
+pub fn start_iris_subscription(state: &AppState) {
+    let Some(iris) = state.iris.clone() else {
+        return;
+    };
+    let handlers = Arc::clone(&state.handlers);
+    let client = state.client.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(iris.subscribe(sender));
+    tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            for handler in handlers.iter().filter(|handler| handler.matches(&event)) {
+                let RiteAction::HttpPost { url } = &handler.action;
+                match client.post(url.clone()).json(&event).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        tracing::info!(handler = %handler.name, "Iris event action completed");
+                    }
+                    Ok(response) => {
+                        tracing::warn!(handler = %handler.name, status = %response.status(), "Iris event action returned failure status");
+                    }
+                    Err(error) => {
+                        tracing::warn!(handler = %handler.name, %error, "Iris event action request failed");
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

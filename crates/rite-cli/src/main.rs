@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
-use rite_server::{app, configured_state, load_config};
+use rite_server::{app, configured_state, load_config, start_iris_subscription};
 
 #[derive(Parser)]
 #[command(name = "rite", about = "Minimal event-to-action runtime")]
@@ -20,10 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let config = load_config(&std::fs::read_to_string(cli.config)?)?;
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
-    axum::serve(
-        listener,
-        app(configured_state(&cli.github_webhook_secret, config)?),
-    )
-    .await?;
+    let state = configured_state(&cli.github_webhook_secret, config)?;
+    start_iris_subscription(&state);
+    axum::serve(listener, app(state)).await?;
     Ok(())
 }

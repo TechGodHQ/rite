@@ -7,15 +7,18 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 hmac.workspace = true
 rite-core = { path = "../rite-core" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 
 [lints]
 workspace = true
