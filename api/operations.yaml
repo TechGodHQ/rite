@@ -28,7 +28,17 @@ operations:
         type: string
         required: true
         location: path
-  # receive_event (/event/{source}) stays HANDWRITTEN in rite-server: webhook
-  # ingress needs raw headers + bytes for HMAC signature verification, which
-  # the generated operation contract does not carry yet. Revisit when hydra
-  # grows raw-request passthrough.
+  - name: receive_event
+    description: Receive a raw webhook delivery for HMAC-verified event ingress.
+    method: POST
+    path: /event/{source}
+    read: false
+    output_type: Value
+    parameters:
+      - name: source
+        description: Event source ID (e.g. github).
+        type: string
+        required: true
+        location: path
+    surfaces: [http]
+    raw_request: true

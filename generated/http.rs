@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use axum::{extract::{State, Path}, response::Response, routing::{get}, Router};
+use axum::{extract::{State, Path}, response::Response, routing::{get, post}, Router};
+use axum::body::Bytes;
+use axum::http::HeaderMap;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,10 +22,26 @@ pub struct GeneratedOperationInput {
     pub body: Value,
 }
 
+/// Input for raw-request operations: the exact raw body bytes
+/// and a header map, for consumers that verify signatures over
+/// the request as received.
+///
+/// Header contract: names are lowercase (HTTP canonical form),
+/// values must be UTF-8 (non-UTF-8 values are dropped), and
+/// repeated headers collapse to the last value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeneratedRawOperationInput {
+    pub path: BTreeMap<String, String>,
+    pub query: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, String>,
+    pub raw_body: Vec<u8>,
+}
+
 pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "list_sources", method: "GET", path: "/sources" },
     GeneratedRoute { name: "list_handlers", method: "GET", path: "/handlers" },
     GeneratedRoute { name: "get_handler", method: "GET", path: "/handlers/{handler_id}" },
+    GeneratedRoute { name: "receive_event", method: "POST", path: "/event/{source}" },
 ];
 
 pub fn generated_router() -> Router<crate::AppState> {
@@ -31,6 +49,7 @@ pub fn generated_router() -> Router<crate::AppState> {
         .route("/sources", get(list_sources))
         .route("/handlers", get(list_handlers))
         .route("/handlers/{handler_id}", get(get_handler))
+        .route("/event/{source}", post(receive_event))
 }
 
 async fn list_sources(
@@ -74,6 +93,34 @@ async fn get_handler(
             path,
             query: BTreeMap::new(),
             body: Value::Null,
+        },
+    )
+    .await
+}
+
+async fn receive_event(
+    State(state): State<crate::AppState>,
+    Path(path): Path<BTreeMap<String, String>>,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Response {
+    let headers: BTreeMap<String, String> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    crate::dispatch::execute_raw_operation_http(
+        &state,
+        "receive_event",
+        GeneratedRawOperationInput {
+            path,
+            query: BTreeMap::new(),
+            headers,
+            raw_body: raw_body.to_vec(),
         },
     )
     .await

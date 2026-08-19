@@ -6,6 +6,7 @@
 //! the same status/message pair.
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
+use rite_core::{EventSource, RiteAction};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -26,6 +27,18 @@ pub struct OperationInput {
     pub query: BTreeMap<String, String>,
     /// JSON body.
     pub body: Value,
+}
+
+/// Raw-request input for a generated raw operation call: the exact body
+/// bytes and headers as received, for signature verification.
+#[derive(Debug, Clone)]
+pub struct RawOperationInput {
+    /// Path parameters.
+    pub path: BTreeMap<String, String>,
+    /// Request headers (lowercase names, non-UTF-8 values dropped).
+    pub headers: Vec<(String, String)>,
+    /// Raw request body bytes.
+    pub raw_body: Vec<u8>,
 }
 
 impl From<generated::GeneratedOperationInput> for OperationInput {
@@ -104,6 +117,81 @@ pub async fn execute_operation_http(
         Ok(value) => Json(value).into_response(),
         Err(err) => (err.status, Json(json!({ "error": err.message }))).into_response(),
     }
+}
+
+/// HTTP adapter the generated raw-request handlers call: the wire bytes and
+/// headers arrive untouched, so HMAC signature verification runs over the
+/// exact received representation.
+///
+/// Unknown operations fall through to the typed JSON error path so every
+/// generated surface reports the same status/message pairs.
+pub async fn execute_raw_operation_http(
+    state: &AppState,
+    operation: &str,
+    input: generated::GeneratedRawOperationInput,
+) -> axum::response::Response {
+    let raw_input = RawOperationInput {
+        path: input.path,
+        headers: input.headers.into_iter().collect::<Vec<_>>(),
+        raw_body: input.raw_body,
+    };
+    match operation {
+        "receive_event" => receive_event(state, raw_input).await,
+        other => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown operation: {other}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Webhook ingress: verify the delivery signature, normalize the payload,
+/// and dispatch every matching handler.
+///
+/// Status contract (unchanged from the pre-generated handwritten handler):
+/// 404 unknown source, 401 failed verification, 400 unparseable payload,
+/// 202 with a JSON ack once handlers have run.
+async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::response::Response {
+    if input.path.get("source").map(String::as_str) != Some("github") {
+        return (StatusCode::NOT_FOUND, "unknown event source").into_response();
+    }
+    if let Err(error) = state.github.verify(&input.headers, &input.raw_body).await {
+        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+    }
+    let event = match state.github.parse(&input.headers, &input.raw_body).await {
+        Ok(event) => event,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let matched = state
+        .handlers
+        .iter()
+        .filter(|handler| handler.matches(&event))
+        .collect::<Vec<_>>();
+    let mut executed = 0_usize;
+    for handler in &matched {
+        match &handler.action {
+            RiteAction::HttpPost { url } => {
+                match state.client.post(url.clone()).json(&event).send().await {
+                    Ok(response) if response.status().is_success() => executed += 1,
+                    Ok(response) => {
+                        tracing::warn!(handler = %handler.name, status = %response.status(), "rite action returned failure status");
+                    }
+                    Err(error) => {
+                        tracing::warn!(handler = %handler.name, %error, "rite action request failed");
+                    }
+                }
+            }
+        }
+    }
+    let matched_handlers = matched
+        .into_iter()
+        .map(|handler| handler.name.clone())
+        .collect::<Vec<_>>();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"event": event, "matched_handlers": matched_handlers, "actions_executed": executed})),
+    )
+        .into_response()
 }
 
 #[allow(clippy::unused_async)]
