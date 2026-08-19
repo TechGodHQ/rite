@@ -1,7 +1,9 @@
 //! Shared operation dispatch for rite's generated surfaces.
 //!
 //! Every generated surface (HTTP today; CLI/MCP when rite grows them)
-//! funnels into [`execute_operation`], keeping each operation implemented
+//! funnels into [`execute_operation`], and raw-request operations
+//! (webhook ingress needing the untouched wire bytes) funnel into
+//! [`execute_raw_operation_http`], keeping each operation implemented
 //! exactly once. Typed errors carry an HTTP status so all surfaces report
 //! the same status/message pair.
 
