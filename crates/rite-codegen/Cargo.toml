@@ -1,0 +1,19 @@
+[package]
+name = "rite-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Code generation for Rite — hydra-backed, keeps HTTP and MCP surfaces in sync"
+
+[lints]
+workspace = true
+
+[dependencies]
+hydra-core = { git = "https://github.com/TechGodHQ/hydra.git", branch = "main" }
+hydra-codegen = { git = "https://github.com/TechGodHQ/hydra.git", branch = "main" }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "rite-codegen"
+path = "src/main.rs"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rite-core", "crates/rite-sources", "crates/rite-server", "crates/rite-cli"]
+members = ["crates/rite-core", "crates/rite-sources", "crates/rite-server", "crates/rite-cli", "crates/rite-codegen"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ description = "Minimal event-to-action runtime"
 authors = ["TechGodHQ"]
 
 [workspace.dependencies]
+anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }

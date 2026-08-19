@@ -1,0 +1,48 @@
+{
+  "locations": {
+    "get_handler": {
+      "handler_id": "path"
+    },
+    "list_handlers": {},
+    "list_sources": {}
+  },
+  "tools": [
+    {
+      "description": "List configured event sources.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_sources"
+    },
+    {
+      "description": "List configured rites (event-to-action handlers).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_handlers"
+    },
+    {
+      "description": "Get one configured rite by ID.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "handler_id": {
+            "description": "Handler ID to fetch.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "handler_id"
+        ],
+        "type": "object"
+      },
+      "name": "get_handler"
+    }
+  ]
+}

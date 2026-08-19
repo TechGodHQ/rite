@@ -90,7 +90,7 @@ pub trait EventSource: Send + Sync {
 }
 
 /// A configured handler that conditionally dispatches an action.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiteHandler {
     /// Human-readable unique handler name.
     pub name: String,
@@ -104,7 +104,7 @@ pub struct RiteHandler {
 }
 
 /// A scalar value used to match an event field or metadata item.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MatchValue {
     /// Textual value.
@@ -126,7 +126,7 @@ impl MatchValue {
 }
 
 /// A supported handler action.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RiteAction {
     /// Forward the normalized event as JSON to an HTTP endpoint.
