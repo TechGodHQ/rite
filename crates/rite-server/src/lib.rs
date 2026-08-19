@@ -4,14 +4,8 @@ pub mod dispatch;
 
 use std::sync::Arc;
 
-use axum::{
-    Json, Router,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
-};
-use rite_core::{EventSource, RiteAction, RiteHandler};
+use axum::{Router, routing::get};
+use rite_core::{RiteAction, RiteHandler};
 use rite_sources::{github::GitHubSource, iris::IrisSource};
 use serde::Deserialize;
 
@@ -50,18 +44,16 @@ pub struct AppState {
 
 /// Creates the Rite HTTP application.
 ///
-/// `/sources` and `/event/{source}` now come from the generated hydra
-/// surface (`generated/http.rs`, dispatched through
-/// [`dispatch::execute_operation_http`]); `/handlers` is new. The
-/// handwritten `sources`/`receive_event` handlers remain below as the
-/// signature-verification reference for the dispatch path.
+/// Every route except `/health` comes from the generated hydra surface
+/// (`generated/http.rs`): read ops dispatch through
+/// [`dispatch::execute_operation_http`], and the `receive_event` webhook
+/// (`POST /event/{source}`) is a `raw_request` operation dispatching
+/// through [`dispatch::execute_raw_operation_http`] so HMAC verification
+/// sees the exact wire bytes and headers.
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(dispatch::generated::generated_router())
-        // Webhook ingress stays handwritten: HMAC verification needs raw
-        // headers + bytes the generated operation contract does not carry.
-        .route("/event/{source}", post(receive_event))
         .with_state(state)
 }
 
@@ -72,63 +64,6 @@ pub fn load_config(input: &str) -> Result<RiteConfig, toml::de::Error> {
 
 async fn health() -> &'static str {
     "ok"
-}
-
-async fn receive_event(
-    State(state): State<AppState>,
-    Path(source): Path<String>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    if source != "github" {
-        return (StatusCode::NOT_FOUND, "unknown event source").into_response();
-    }
-    let headers = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.to_string(), value.to_owned()))
-        })
-        .collect::<Vec<_>>();
-    if let Err(error) = state.github.verify(&headers, &body).await {
-        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
-    }
-    let event = match state.github.parse(&headers, &body).await {
-        Ok(event) => event,
-        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-    };
-    let matched = state
-        .handlers
-        .iter()
-        .filter(|handler| handler.matches(&event))
-        .collect::<Vec<_>>();
-    let mut executed = 0_usize;
-    for handler in &matched {
-        match &handler.action {
-            RiteAction::HttpPost { url } => {
-                match state.client.post(url.clone()).json(&event).send().await {
-                    Ok(response) if response.status().is_success() => executed += 1,
-                    Ok(response) => {
-                        tracing::warn!(handler = %handler.name, status = %response.status(), "rite action returned failure status");
-                    }
-                    Err(error) => {
-                        tracing::warn!(handler = %handler.name, %error, "rite action request failed");
-                    }
-                }
-            }
-        }
-    }
-    let matched_handlers = matched
-        .into_iter()
-        .map(|handler| handler.name.clone())
-        .collect::<Vec<_>>();
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"event": event, "matched_handlers": matched_handlers, "actions_executed": executed})),
-    )
-        .into_response()
 }
 
 /// Builds state with a GitHub source and TOML-configured handlers.
@@ -180,7 +115,7 @@ pub fn start_iris_subscription(state: &AppState) {
 mod tests {
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, header},
+        http::{Request, StatusCode, header},
     };
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -230,5 +165,79 @@ mod tests {
                 .expect("utf8")
                 .contains("GitHub push to rite")
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_is_unauthorized() {
+        let state = configured_state("secret", RiteConfig::default()).expect("valid state");
+        let app = app(state);
+        let body = br#"{"ref":"refs/heads/main","repository":{"name":"rite"}}"#;
+        let response = app
+            .oneshot(
+                Request::post("/event/github")
+                    .header("X-GitHub-Event", "push")
+                    .header("X-Hub-Signature-256", signature("wrong", body))
+                    .body(Body::from(body.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unknown_source_is_not_found() {
+        let state = configured_state("secret", RiteConfig::default()).expect("valid state");
+        let app = app(state);
+        let body = br#"{"ref":"refs/heads/main","repository":{"name":"rite"}}"#;
+        let response = app
+            .oneshot(
+                Request::post("/event/gitlab")
+                    .header("X-GitHub-Event", "push")
+                    .header("X-Hub-Signature-256", signature("secret", body))
+                    .body(Body::from(body.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn malformed_event_is_bad_request() {
+        let state = configured_state("secret", RiteConfig::default()).expect("valid state");
+        let app = app(state);
+        let body = b"not json at all";
+        let response = app
+            .oneshot(
+                Request::post("/event/github")
+                    .header("X-GitHub-Event", "push")
+                    .header("X-Hub-Signature-256", signature("secret", body))
+                    .body(Body::from(body.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_utf8_header_values_are_dropped_without_breaking_verification() {
+        let state = configured_state("secret", RiteConfig::default()).expect("valid state");
+        let app = app(state);
+        let body = br#"{"ref":"refs/heads/main","repository":{"name":"rite"}}"#;
+        let opaque = axum::http::HeaderValue::from_bytes(&[0xFF, 0xFE]).expect("obs-text value");
+        let response = app
+            .oneshot(
+                Request::post("/event/github")
+                    .header("X-GitHub-Event", "push")
+                    .header("X-Hub-Signature-256", signature("secret", body))
+                    .header("X-Custom-Opaque", opaque)
+                    .body(Body::from(body.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 }
