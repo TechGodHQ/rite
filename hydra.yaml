@@ -1,0 +1,6 @@
+# Hydra generation config for rite.
+# Generated code is include!()'d into rite-server, so dispatch and state use
+# crate-local paths.
+http_dispatch_fn: "crate::dispatch::execute_operation_http"
+http_state_type: "crate::AppState"
+sse_binding_prefix: "super::"

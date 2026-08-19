@@ -1,5 +1,7 @@
 //! HTTP service for Rite.
 
+pub mod dispatch;
+
 use std::sync::Arc;
 
 use axum::{
@@ -11,7 +13,7 @@ use axum::{
 };
 use rite_core::{EventSource, RiteAction, RiteHandler};
 use rite_sources::{github::GitHubSource, iris::IrisSource};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Server configuration loaded from TOML.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -47,10 +49,18 @@ pub struct AppState {
 }
 
 /// Creates the Rite HTTP application.
+///
+/// `/sources` and `/event/{source}` now come from the generated hydra
+/// surface (`generated/http.rs`, dispatched through
+/// [`dispatch::execute_operation_http`]); `/handlers` is new. The
+/// handwritten `sources`/`receive_event` handlers remain below as the
+/// signature-verification reference for the dispatch path.
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/sources", get(sources))
+        .merge(dispatch::generated::generated_router())
+        // Webhook ingress stays handwritten: HMAC verification needs raw
+        // headers + bytes the generated operation contract does not carry.
         .route("/event/{source}", post(receive_event))
         .with_state(state)
 }
@@ -62,28 +72,6 @@ pub fn load_config(input: &str) -> Result<RiteConfig, toml::de::Error> {
 
 async fn health() -> &'static str {
     "ok"
-}
-
-#[derive(Serialize)]
-struct SourceResponse {
-    id: &'static str,
-    name: &'static str,
-}
-
-async fn sources(State(state): State<AppState>) -> Json<Vec<SourceResponse>> {
-    let metadata = state.github.metadata();
-    let mut sources = vec![SourceResponse {
-        id: metadata.id,
-        name: metadata.name,
-    }];
-    if let Some(iris) = &state.iris {
-        let metadata = iris.metadata();
-        sources.push(SourceResponse {
-            id: metadata.id,
-            name: metadata.name,
-        });
-    }
-    Json(sources)
 }
 
 async fn receive_event(
