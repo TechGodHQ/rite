@@ -15,6 +15,7 @@ pub fn rite_generate_config() -> GenerateConfig {
         http_dispatch_fn: "crate::dispatch::execute_operation_http".to_string(),
         http_state_type: "crate::AppState".to_string(),
         sse_binding_prefix: "super::".to_string(),
+        http_raw_dispatch_fn: "crate::dispatch::execute_raw_operation_http".to_string(),
         generator_name: "hydra (rite)".to_string(),
     }
 }
