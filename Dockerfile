@@ -3,7 +3,7 @@
 
 # Pin builder to bookworm so glibc matches the bookworm runtime
 # (rust:1-slim tracks trixie / glibc 2.39; mismatched binaries crash).
-FROM rust:1-bookworm-slim AS builder
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev pkg-config \
