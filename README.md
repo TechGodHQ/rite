@@ -43,6 +43,26 @@ Iris messages become `source = "iris"` events. `event_type` is the Iris message 
 contains `provider`, `source_id`, `sender`, `kind`, `iris_metadata`, and the complete original
 Iris message under `message` for future matching needs.
 
+## Self-hosting with Docker
+
+Published images are available from GitHub Container Registry after a release tag:
+`ghcr.io/techgodhq/rite:<version>` (or `:latest`). Supply a webhook secret and,
+when Rite should subscribe to Iris events, its private Iris URL:
+
+```bash
+docker run --rm \
+  --name rite \
+  --publish 127.0.0.1:8080:8080 \
+  --env RITE_GITHUB_WEBHOOK_SECRET="${RITE_GITHUB_WEBHOOK_SECRET}" \
+  --env RITE_IRIS_BASE_URL="http://iris.internal:9876" \
+  ghcr.io/techgodhq/rite:latest
+```
+
+`RITE_GITHUB_WEBHOOK_SECRET` is required for authenticated GitHub webhook
+ingress. Omit `RITE_IRIS_BASE_URL` when you do not want an Iris subscription.
+For a complete private-network example with both services, use the Iris
+repository's [`deploy/docker-compose.yml`](https://github.com/TechGodHQ/iris/blob/main/deploy/docker-compose.yml).
+
 ## Development
 
 ```bash
