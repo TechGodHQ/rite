@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 # Rite server image (linux/arm64 — built on builder-01).
 
-FROM rust:1-slim AS builder
+# Pin builder to bookworm so glibc matches the bookworm runtime
+# (rust:1-slim tracks trixie / glibc 2.39; mismatched binaries crash).
+FROM rust:1-bookworm-slim AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev pkg-config \
