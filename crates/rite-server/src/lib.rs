@@ -2,9 +2,15 @@
 
 pub mod dispatch;
 
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
-use axum::{Router, routing::get};
+use axum::{Json, Router, routing::get};
 use rite_core::{RiteAction, RiteHandler};
 use rite_sources::{github::GitHubSource, iris::IrisSource};
 use serde::Deserialize;
@@ -40,6 +46,28 @@ pub struct AppState {
     pub github: Arc<GitHubSource>,
     pub client: reqwest::Client,
     pub iris: Option<IrisSource>,
+    pub metrics: Arc<Metrics>,
+}
+
+/// Process-local counters exposed by `/status`.
+pub struct Metrics {
+    pub events_received: AtomicU64,
+    pub events_matched: AtomicU64,
+    pub actions_succeeded: AtomicU64,
+    pub actions_failed: AtomicU64,
+    started_at: Instant,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            events_received: AtomicU64::new(0),
+            events_matched: AtomicU64::new(0),
+            actions_succeeded: AtomicU64::new(0),
+            actions_failed: AtomicU64::new(0),
+            started_at: Instant::now(),
+        }
+    }
 }
 
 /// Creates the Rite HTTP application.
@@ -53,6 +81,7 @@ pub struct AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .merge(dispatch::generated::generated_router())
         .with_state(state)
 }
@@ -64,6 +93,19 @@ pub fn load_config(input: &str) -> Result<RiteConfig, toml::de::Error> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn status(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "events_received": state.metrics.events_received.load(Ordering::Relaxed),
+        "events_matched": state.metrics.events_matched.load(Ordering::Relaxed),
+        "actions_succeeded": state.metrics.actions_succeeded.load(Ordering::Relaxed),
+        "actions_failed": state.metrics.actions_failed.load(Ordering::Relaxed),
+        "uptime_seconds": state.metrics.started_at.elapsed().as_secs(),
+        "handlers_loaded": state.handlers.len(),
+    }))
 }
 
 /// Builds state with a GitHub source and TOML-configured handlers.
@@ -79,6 +121,7 @@ pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<A
         github: Arc::new(GitHubSource::new(secret)?),
         client: reqwest::Client::new(),
         iris,
+        metrics: Arc::new(Metrics::default()),
     })
 }
 
@@ -89,21 +132,35 @@ pub fn start_iris_subscription(state: &AppState) {
     };
     let handlers = Arc::clone(&state.handlers);
     let client = state.client.clone();
+    let metrics = Arc::clone(&state.metrics);
     let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     tokio::spawn(iris.subscribe(sender));
     tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {
-            for handler in handlers.iter().filter(|handler| handler.matches(&event)) {
+            metrics.events_received.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(source = %event.source, event_type = %event.event_type, action = ?event.action, "Iris event received");
+            let matched = handlers
+                .iter()
+                .filter(|handler| handler.matches(&event))
+                .collect::<Vec<_>>();
+            if !matched.is_empty() {
+                metrics.events_matched.fetch_add(1, Ordering::Relaxed);
+            }
+            for handler in matched {
+                tracing::info!(handler = %handler.name, "Iris event matched handler");
                 let RiteAction::HttpPost { url } = &handler.action;
                 match client.post(url.clone()).json(&event).send().await {
                     Ok(response) if response.status().is_success() => {
+                        metrics.actions_succeeded.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(handler = %handler.name, "Iris event action completed");
                     }
                     Ok(response) => {
+                        metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(handler = %handler.name, status = %response.status(), "Iris event action returned failure status");
                     }
-                    Err(error) => {
-                        tracing::warn!(handler = %handler.name, %error, "Iris event action request failed");
+                    Err(_error) => {
+                        metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(handler = %handler.name, "Iris event action request failed");
                     }
                 }
             }
@@ -146,6 +203,7 @@ mod tests {
 
         let body = br#"{"ref":"refs/heads/main","repository":{"name":"rite"}}"#;
         let response = app
+            .clone()
             .oneshot(
                 Request::post("/event/github")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -165,6 +223,24 @@ mod tests {
                 .expect("utf8")
                 .contains("GitHub push to rite")
         );
+
+        let status = app
+            .oneshot(
+                Request::get("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = to_bytes(status.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let status: serde_json::Value = serde_json::from_slice(&status).expect("json");
+        assert_eq!(status["events_received"], 1);
+        assert_eq!(status["events_matched"], 0);
+        assert_eq!(status["actions_succeeded"], 0);
+        assert_eq!(status["actions_failed"], 0);
     }
 
     #[tokio::test]

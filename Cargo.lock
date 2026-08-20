@@ -1077,6 +1077,7 @@ dependencies = [
  "clap",
  "rite-server",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

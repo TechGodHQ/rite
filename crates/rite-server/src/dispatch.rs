@@ -164,22 +164,49 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
         Ok(event) => event,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
+    state
+        .metrics
+        .events_received
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(source = %event.source, event_type = %event.event_type, action = ?event.action, "Webhook event received");
     let matched = state
         .handlers
         .iter()
         .filter(|handler| handler.matches(&event))
         .collect::<Vec<_>>();
+    if !matched.is_empty() {
+        state
+            .metrics
+            .events_matched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut executed = 0_usize;
     for handler in &matched {
+        tracing::info!(handler = %handler.name, "Webhook event matched handler");
         match &handler.action {
             RiteAction::HttpPost { url } => {
                 match state.client.post(url.clone()).json(&event).send().await {
-                    Ok(response) if response.status().is_success() => executed += 1,
+                    Ok(response) if response.status().is_success() => {
+                        executed += 1;
+                        state
+                            .metrics
+                            .actions_succeeded
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(handler = %handler.name, status = %response.status(), "rite action completed");
+                    }
                     Ok(response) => {
+                        state
+                            .metrics
+                            .actions_failed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(handler = %handler.name, status = %response.status(), "rite action returned failure status");
                     }
-                    Err(error) => {
-                        tracing::warn!(handler = %handler.name, %error, "rite action request failed");
+                    Err(_error) => {
+                        state
+                            .metrics
+                            .actions_failed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(handler = %handler.name, "rite action request failed");
                     }
                 }
             }
