@@ -15,6 +15,24 @@ use rite_core::{RiteAction, RiteHandler};
 use rite_sources::{github::GitHubSource, iris::IrisSource};
 use serde::Deserialize;
 
+/// Severity emitted while checking a loaded configuration before the server starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticLevel {
+    /// Configuration is usable but likely accidental.
+    Warning,
+    /// Configuration cannot safely be served.
+    Error,
+}
+
+/// A secret-free configuration diagnostic suitable for startup logging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    /// Severity that determines whether startup may continue.
+    pub level: DiagnosticLevel,
+    /// Human-readable explanation of the configuration problem.
+    pub message: String,
+}
+
 /// Server configuration loaded from TOML.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RiteConfig {
@@ -89,6 +107,69 @@ pub fn app(state: AppState) -> Router {
 /// Parse handler configuration from TOML text.
 pub fn load_config(input: &str) -> Result<RiteConfig, toml::de::Error> {
     toml::from_str(input)
+}
+
+/// Validate configuration without performing network or filesystem I/O.
+#[must_use]
+pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let configured_sources = [Some("github"), config.sources.iris.as_ref().map(|_| "iris")]
+        .into_iter()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if config.rites.is_empty() {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message: "no handlers configured; Rite will receive events but take no actions".into(),
+        });
+    }
+    if let Some(iris) = &config.sources.iris
+        && iris.enabled
+        && iris.base_url.trim().is_empty()
+    {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            message: "enabled source 'iris' has an empty base_url".into(),
+        });
+    }
+
+    let mut names = std::collections::BTreeSet::new();
+    for handler in &config.rites {
+        if !configured_sources.contains(handler.source.as_str()) {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!(
+                    "handler '{}' references unknown source '{}'",
+                    handler.name, handler.source
+                ),
+            });
+        }
+        if !names.insert(handler.name.as_str()) {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("duplicate handler name '{}'", handler.name),
+            });
+        }
+    }
+    diagnostics
+}
+
+/// A secret-free configuration inventory for startup logs.
+#[must_use]
+pub fn startup_summary(config: &RiteConfig) -> String {
+    let source_count = 1 + usize::from(config.sources.iris.is_some());
+    let enabled_count = 1 + usize::from(
+        config
+            .sources
+            .iris
+            .as_ref()
+            .is_some_and(|source| source.enabled),
+    );
+    format!(
+        "rite: {source_count} sources ({enabled_count} enabled), {} handlers loaded",
+        config.rites.len()
+    )
 }
 
 async fn health() -> &'static str {
@@ -184,6 +265,47 @@ mod tests {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn validation_reports_invalid_configuration() {
+        let config = load_config(
+            "[[rites]]\nname = \"duplicate\"\nsource = \"missing\"\naction = { type = \"http_post\", url = \"http://example.test\" }\n\n[[rites]]\nname = \"duplicate\"\nsource = \"github\"\naction = { type = \"http_post\", url = \"http://example.test\" }\n\n[sources.iris]\nenabled = true\nbase_url = \"  \"\n",
+        )
+        .expect("config parses");
+        let diagnostics = validate(&config);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown source"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("duplicate handler"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("empty base_url"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+        );
+    }
+
+    #[test]
+    fn validation_warns_when_no_handlers_are_configured() {
+        let diagnostics = validate(&RiteConfig::default());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Warning);
+        assert!(diagnostics[0].message.contains("no handlers"));
+        assert_eq!(
+            startup_summary(&RiteConfig::default()),
+            "rite: 1 sources (1 enabled), 0 handlers loaded"
+        );
     }
 
     #[tokio::test]
