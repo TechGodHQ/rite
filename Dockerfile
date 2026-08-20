@@ -21,7 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --system --home /data --shell /usr/sbin/nologin rite
 COPY --from=builder /usr/local/bin/rite /usr/local/bin/rite
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /etc/rite /data \
+    && chown -R rite:rite /etc/rite /data
 ENV RITE_CONFIG=/etc/rite/rite.toml
 USER rite
 EXPOSE 8080
