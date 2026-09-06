@@ -37,6 +37,24 @@ Endpoints:
 - `GET /sources` — configured source adapters
 - `POST /event/github` — authenticated GitHub webhook ingress using `X-Hub-Signature-256`
 
+## CLI and MCP
+
+Rite's agent-facing read operations are generated from `api/operations.yaml` and run through the
+same `execute_operation` dispatch as HTTP. They load the local configuration and print JSON, so
+no HTTP server or webhook secret is required:
+
+```bash
+cargo run -p rite-cli -- list-sources --config rite.example.toml
+cargo run -p rite-cli -- list-handlers --config rite.example.toml
+cargo run -p rite-cli -- get-handler github-pr-opened --config rite.example.toml
+```
+
+`rite serve --config rite.toml --github-webhook-secret "$RITE_GITHUB_WEBHOOK_SECRET"` explicitly
+starts the server; omitting the subcommand remains equivalent for compatibility. The generated
+`generated/mcp.json` declares the same read operations for MCP hosts over the existing HTTP
+endpoints: `GET /sources`, `GET /handlers`, and `GET /handlers/{handler_id}`. No separate server
+surface is needed.
+
 When enabled, the Iris source subscribes to `GET /v1/events` in the background. It reconnects
 with exponential backoff (1–60 seconds), so Rite remains healthy while Iris is unavailable.
 Iris messages become `source = "iris"` events. `event_type` is the Iris message kind and metadata
