@@ -7,6 +7,7 @@ action = { type = "http_post", url = "https://example.test/hooks/pr" }
 [sources.iris]
 enabled = true
 base_url = "http://127.0.0.1:3000"
+# api_token = "set-through-your-secret-manager"
 
 [[rites]]
 name = "urgent-telegram"

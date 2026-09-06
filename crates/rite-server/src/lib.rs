@@ -55,6 +55,8 @@ pub struct IrisConfig {
     #[serde(default)]
     pub enabled: bool,
     pub base_url: String,
+    #[serde(default)]
+    pub api_token: Option<String>,
 }
 
 /// Shared HTTP application state.
@@ -133,6 +135,22 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
             message: "enabled source 'iris' has an empty base_url".into(),
         });
     }
+    if let Some(iris) = &config.sources.iris
+        && iris.enabled
+        && !iris.base_url.trim().is_empty()
+    {
+        match iris.api_token.as_deref() {
+            Some(token) if token.trim().is_empty() => diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "enabled source 'iris' has a blank api_token".into(),
+            }),
+            None => diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                message: "enabled source 'iris' has no api_token; this only works with unauthenticated Iris".into(),
+            }),
+            Some(_) => {}
+        }
+    }
 
     let mut names = std::collections::BTreeSet::new();
     for handler in &config.rites {
@@ -195,7 +213,7 @@ pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<A
         .sources
         .iris
         .filter(|config| config.enabled)
-        .map(|config| IrisSource::new(config.base_url))
+        .map(|config| IrisSource::new_with_token(config.base_url, config.api_token.as_deref()))
         .transpose()?;
     Ok(AppState {
         handlers: Arc::new(config.rites),
