@@ -81,6 +81,25 @@ ingress. Omit `RITE_IRIS_BASE_URL` when you do not want an Iris subscription.
 For a complete private-network example with both services, use the Iris
 repository's [`deploy/docker-compose.yml`](https://github.com/TechGodHQ/iris/blob/main/deploy/docker-compose.yml).
 
+## HTTP actions
+
+`http_post` forwards the normalized event as JSON by default. A handler may
+instead set `body_template` to render a deterministic text body using
+`{{event_type}}`, `{{action}}`, `{{title}}`, `{{body}}`, or nested event
+metadata such as `{{metadata.provider}}`; missing fields render empty.
+Optional `headers` are forwarded verbatim. Templated bodies default to
+`Content-Type: text/plain` unless that header is explicitly set. This remains
+a generic HTTP action: Discord, Slack, and other webhook targets do not add
+provider-specific Rite action types.
+
+```toml
+[[rites]]
+name = "deploy-alert"
+source = "iris"
+match = { body_contains = "URGENT" }
+action = { type = "http_post", url = "https://hooks.example.test/alerts", headers = { "content-type" = "application/json" }, body_template = "{\"content\":\"{{title}}: {{body}}\"}" }
+```
+
 ## Development
 
 ```bash

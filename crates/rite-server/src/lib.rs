@@ -229,8 +229,27 @@ pub fn start_iris_subscription(state: &AppState) {
             }
             for handler in matched {
                 tracing::info!(handler = %handler.name, "Iris event matched handler");
-                let RiteAction::HttpPost { url } = &handler.action;
-                match client.post(url.clone()).json(&event).send().await {
+                let RiteAction::HttpPost {
+                    url,
+                    headers,
+                    body_template,
+                } = &handler.action;
+                let mut request = client.post(url.clone());
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                if let Some(template) = body_template {
+                    if !headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("content-type"))
+                    {
+                        request = request.header("content-type", "text/plain");
+                    }
+                    request = request.body(rite_core::render_template(template, &event));
+                } else {
+                    request = request.json(&event);
+                }
+                match request.send().await {
                     Ok(response) if response.status().is_success() => {
                         metrics.actions_succeeded.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(handler = %handler.name, "Iris event action completed");

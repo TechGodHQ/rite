@@ -129,8 +129,82 @@ impl MatchValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RiteAction {
-    /// Forward the normalized event as JSON to an HTTP endpoint.
-    HttpPost { url: Url },
+    /// Forward the normalized event as JSON, or a configured template, to an HTTP endpoint.
+    HttpPost {
+        /// Destination URL.
+        url: Url,
+        /// Additional request headers. Existing configurations omit this field.
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        /// Optional `{{field}}` template for the request body.
+        #[serde(default)]
+        body_template: Option<String>,
+    },
+}
+
+/// Render a deterministic HTTP action template against a normalized event.
+///
+/// Supported fields are `source`, `event_type`, `action`, `timestamp`,
+/// `severity`, `title`, `body`, and `metadata.<key>[.<nested-key>...]`.
+/// Missing fields intentionally render as an empty string so a handler cannot
+/// fail merely because an optional source field was absent.
+#[must_use]
+pub fn render_template(template: &str, event: &RiteEvent) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(open) = remaining.find("{{") {
+        rendered.push_str(&remaining[..open]);
+        let field_start = open + 2;
+        let Some(close_offset) = remaining[field_start..].find("}}") else {
+            rendered.push_str(&remaining[open..]);
+            return rendered;
+        };
+        let field_end = field_start + close_offset;
+        rendered.push_str(&template_value(&remaining[field_start..field_end], event));
+        remaining = &remaining[field_end + 2..];
+    }
+    rendered.push_str(remaining);
+    rendered
+}
+
+fn template_value(field: &str, event: &RiteEvent) -> String {
+    match field {
+        "source" => event.source.clone(),
+        "event_type" => event.event_type.clone(),
+        "action" => event.action.clone().unwrap_or_default(),
+        "timestamp" => event.timestamp.to_rfc3339(),
+        "severity" => serde_json::to_value(event.severity)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_default(),
+        "title" => event.title.clone(),
+        "body" => event.body.clone().unwrap_or_default(),
+        field => field
+            .strip_prefix("metadata.")
+            .and_then(|path| template_metadata_value(path, &event.metadata))
+            .map(json_value_text)
+            .unwrap_or_default(),
+    }
+}
+
+fn template_metadata_value<'a>(
+    path: &str,
+    metadata: &'a BTreeMap<String, Value>,
+) -> Option<&'a Value> {
+    let mut segments = path.split('.');
+    let mut value = metadata.get(segments.next()?)?;
+    for segment in segments {
+        value = value.get(segment)?;
+    }
+    Some(value)
+}
+
+fn json_value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 impl RiteHandler {
@@ -212,5 +286,49 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
             metadata: BTreeMap::new(),
         };
         assert!(handler.matches(&event));
+    }
+
+    #[test]
+    fn templates_render_event_and_nested_metadata_fields() {
+        let event = RiteEvent {
+            source: "iris".into(),
+            event_type: "text".into(),
+            action: None,
+            timestamp: Utc::now(),
+            severity: Severity::Warning,
+            title: "Attention".into(),
+            body: Some("Deploy paused".into()),
+            metadata: BTreeMap::from([(
+                "provider".into(),
+                serde_json::json!({ "name": "telegram", "id": 42 }),
+            )]),
+        };
+
+        assert_eq!(
+            render_template(
+                "{{event_type}}/{{action}} {{title}}: {{body}} {{metadata.provider.name}} #{{metadata.provider.id}} {{metadata.missing}}",
+                &event,
+            ),
+            "text/ Attention: Deploy paused telegram #42 "
+        );
+    }
+
+    #[test]
+    fn http_post_defaults_preserve_existing_toml() {
+        let handler: RiteHandler = toml::from_str(
+            r#"name = "legacy"
+source = "github"
+action = { type = "http_post", url = "https://example.test/hook" }"#,
+        )
+        .expect("legacy handler parses");
+
+        assert!(matches!(
+            handler.action,
+            RiteAction::HttpPost {
+                headers,
+                body_template: None,
+                ..
+            } if headers.is_empty()
+        ));
     }
 }
