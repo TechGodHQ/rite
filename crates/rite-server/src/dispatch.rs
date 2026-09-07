@@ -184,8 +184,27 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
     for handler in &matched {
         tracing::info!(handler = %handler.name, "Webhook event matched handler");
         match &handler.action {
-            RiteAction::HttpPost { url } => {
-                match state.client.post(url.clone()).json(&event).send().await {
+            RiteAction::HttpPost {
+                url,
+                headers,
+                body_template,
+            } => {
+                let mut request = state.client.post(url.clone());
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                if let Some(template) = body_template {
+                    if !headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("content-type"))
+                    {
+                        request = request.header("content-type", "text/plain");
+                    }
+                    request = request.body(rite_core::render_template(template, &event));
+                } else {
+                    request = request.json(&event);
+                }
+                match request.send().await {
                     Ok(response) if response.status().is_success() => {
                         executed += 1;
                         state

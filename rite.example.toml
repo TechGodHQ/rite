@@ -9,7 +9,7 @@ enabled = true
 base_url = "http://127.0.0.1:3000"
 
 [[rites]]
-name = "urgent-telegram"
+name = "discord-urgent-alert"
 source = "iris"
 match = { provider = "telegram", body_contains = "URGENT" }
-action = { type = "http_post", url = "https://example.test/hooks/urgent" }
+action = { type = "http_post", url = "https://example.test/hooks/urgent", headers = { "content-type" = "application/json" }, body_template = "{\"content\":\"{{title}}: {{body}}\"}" }
