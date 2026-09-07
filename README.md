@@ -5,8 +5,9 @@
 Rite is a self-hostable, minimal event-to-action runtime. It receives authenticated events, normalizes them, matches TOML-configured handlers, and forwards matching events to actions.
 
 ```text
-GitHub webhook ──> Rite ──> configured HTTP action
-Iris event     ──> Rite ──> configured HTTP action
+GitHub webhook      ──> Rite ──> configured HTTP action
+Uptime Kuma webhook ──> Rite ──> configured HTTP action
+Iris event          ──> Rite ──> configured HTTP action
 ```
 
 ## Quick start
@@ -23,6 +24,11 @@ action = { type = "http_post", url = "https://example.test/hooks/pr" }
 [sources.iris]
 enabled = true
 base_url = "http://127.0.0.1:3000"
+
+# Required when this ingress source is enabled.
+[sources.uptime_kuma]
+enabled = true
+secret = "change-me"
 ```
 
 Run it:
@@ -36,6 +42,7 @@ Endpoints:
 - `GET /health` — returns `ok`
 - `GET /sources` — configured source adapters
 - `POST /event/github` — authenticated GitHub webhook ingress using `X-Hub-Signature-256`
+- `POST /event/uptime_kuma` — authenticated Uptime Kuma webhook ingress using base64 `Signature` HMAC-SHA256
 
 ## CLI and MCP
 
@@ -109,4 +116,4 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Rite currently normalizes GitHub `push` and `pull_request` payloads, matches configured handlers, and executes `http_post` actions with the normalized event as JSON.
+Rite normalizes GitHub `push` and `pull_request` payloads plus Uptime Kuma heartbeats, matches configured handlers, and executes `http_post` actions with the normalized event as JSON. Uptime Kuma heartbeats require a configured secret; `status` maps deterministically to `up` (info), `down` (critical), `pending` (warning), or `maintenance` (info). Matching-safe metadata includes `monitor_name`, `monitor_id`, `status`, plus present URL/timing fields; Kuma's `msg` becomes the optional event body.

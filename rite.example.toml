@@ -8,6 +8,11 @@ action = { type = "http_post", url = "https://example.test/hooks/pr" }
 enabled = true
 base_url = "http://127.0.0.1:3000"
 
+# Uptime Kuma sends base64 HMAC-SHA256 in its Signature header. A secret is required.
+[sources.uptime_kuma]
+enabled = true
+secret = "change-me"
+
 [[rites]]
 name = "discord-urgent-alert"
 source = "iris"
