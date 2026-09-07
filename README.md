@@ -62,9 +62,12 @@ starts the server; omitting the subcommand remains equivalent for compatibility.
 endpoints: `GET /sources`, `GET /handlers`, and `GET /handlers/{handler_id}`. No separate server
 surface is needed.
 
-When enabled, the Iris source subscribes to `GET /v1/events` in the background. It reconnects
-with exponential backoff (1–60 seconds), so Rite remains healthy while Iris is unavailable.
-Iris messages become `source = "iris"` events. `event_type` is the Iris message kind and metadata
+When enabled, the Iris source subscribes to `GET /v1/events` in the background. Set
+`sources.iris.api_token` (or `RITE_IRIS_API_TOKEN` in Docker) when Iris requires bearer
+authentication; Rite sends it only as the subscription's `Authorization: Bearer` header, including
+on reconnects. Without a token Rite warns at startup so legacy unauthenticated Iris deployments
+remain supported. It reconnects with exponential backoff (1–60 seconds), so Rite remains healthy
+while Iris is unavailable. Iris messages become `source = "iris"` events. `event_type` is the Iris message kind and metadata
 contains `provider`, `source_id`, `sender`, `kind`, `iris_metadata`, and the complete original
 Iris message under `message` for future matching needs.
 
@@ -80,11 +83,14 @@ docker run --rm \
   --publish 127.0.0.1:8080:8080 \
   --env RITE_GITHUB_WEBHOOK_SECRET="${RITE_GITHUB_WEBHOOK_SECRET}" \
   --env RITE_IRIS_BASE_URL="http://iris.internal:9876" \
+  --env RITE_IRIS_API_TOKEN="${RITE_IRIS_API_TOKEN}" \
   ghcr.io/techgodhq/rite:latest
 ```
 
 `RITE_GITHUB_WEBHOOK_SECRET` is required for authenticated GitHub webhook
-ingress. Omit `RITE_IRIS_BASE_URL` when you do not want an Iris subscription.
+ingress. Omit `RITE_IRIS_BASE_URL` when you do not want an Iris subscription. Set
+`RITE_IRIS_API_TOKEN` whenever that Iris instance has `IRIS_API_TOKEN` configured; it is not
+written to logs.
 For a complete private-network example with both services, use the Iris
 repository's [`deploy/docker-compose.yml`](https://github.com/TechGodHQ/iris/blob/main/deploy/docker-compose.yml).
 

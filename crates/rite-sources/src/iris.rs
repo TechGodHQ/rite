@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use rite_core::{Result, RiteError, RiteEvent, Severity, SourceMetadata};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -41,8 +42,13 @@ struct IrisSender {
 }
 
 impl IrisSource {
-    /// Creates an Iris source for an HTTP base URL.
+    /// Creates an unauthenticated Iris source for an HTTP base URL.
     pub fn new(base_url: impl AsRef<str>) -> Result<Self> {
+        Self::new_with_token(base_url, None)
+    }
+
+    /// Creates an Iris source for an HTTP base URL and optional bearer token.
+    pub fn new_with_token(base_url: impl AsRef<str>, api_token: Option<&str>) -> Result<Self> {
         let base_url = base_url.as_ref().trim().trim_end_matches('/');
         let parsed = reqwest::Url::parse(base_url)
             .map_err(|error| RiteError::Config(format!("invalid Iris base URL: {error}")))?;
@@ -51,9 +57,25 @@ impl IrisSource {
                 "Iris base URL must use http or https".into(),
             ));
         }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = api_token {
+            let mut value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                RiteError::Config("Iris API token contains invalid header characters".into())
+            })?;
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
+        }
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .map_err(|error| {
+                RiteError::Config(format!("failed to configure Iris client: {error}"))
+            })?;
+
         Ok(Self {
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client,
         })
     }
 
@@ -180,7 +202,7 @@ impl IrisSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn preserves_the_full_iris_message_for_matching() {
@@ -227,5 +249,50 @@ mod tests {
         let event = receiver.recv().await.expect("event delivered");
         assert_eq!(event.source, "iris");
         assert_eq!(event.body.as_deref(), Some("héllo"));
+    }
+
+    #[tokio::test]
+    async fn sends_bearer_token_only_when_configured() {
+        for token in [Some("test-token"), None] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener binds");
+            let address = listener.local_addr().expect("listener address");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("client connects");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 1024];
+                    let bytes = socket.read(&mut chunk).await.expect("request reads");
+                    if bytes == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..bytes]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("response writes");
+                String::from_utf8(request).expect("request is UTF-8")
+            });
+            let source = IrisSource::new_with_token(format!("http://{address}"), token)
+                .expect("source configures");
+            let (sender, _receiver) = mpsc::channel(1);
+            source
+                .consume_stream(&sender)
+                .await
+                .expect("stream consumes");
+            let request = server.await.expect("server completes");
+            let authorization = request
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("authorization:"));
+            assert_eq!(authorization.is_some(), token.is_some());
+            if let Some(authorization) = authorization {
+                assert!(authorization.starts_with("authorization: Bearer "));
+            }
+        }
     }
 }
