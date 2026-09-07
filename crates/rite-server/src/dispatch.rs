@@ -8,7 +8,7 @@
 //! the same status/message pair.
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
-use rite_core::{EventSource, RiteAction};
+use rite_core::RiteAction;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -154,13 +154,16 @@ pub async fn execute_raw_operation_http(
 /// 404 unknown source, 401 failed verification, 400 unparseable payload,
 /// 202 with a JSON ack once handlers have run.
 async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::response::Response {
-    if input.path.get("source").map(String::as_str) != Some("github") {
+    let Some(source_id) = input.path.get("source") else {
         return (StatusCode::NOT_FOUND, "unknown event source").into_response();
-    }
-    if let Err(error) = state.github.verify(&input.headers, &input.raw_body).await {
+    };
+    let Some(source) = state.sources.get(source_id) else {
+        return (StatusCode::NOT_FOUND, "unknown event source").into_response();
+    };
+    if let Err(error) = source.verify(&input.headers, &input.raw_body).await {
         return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
     }
-    let event = match state.github.parse(&input.headers, &input.raw_body).await {
+    let event = match source.parse(&input.headers, &input.raw_body).await {
         Ok(event) => event,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
@@ -244,7 +247,14 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
 
 #[allow(clippy::unused_async)]
 async fn list_sources(state: &AppState) -> Result<Value, OperationError> {
-    let mut sources = vec![json!({"id": "github", "name": "GitHub"})];
+    let mut sources = state
+        .sources
+        .values()
+        .map(|source| {
+            let metadata = source.metadata();
+            json!({"id": metadata.id, "name": metadata.name})
+        })
+        .collect::<Vec<_>>();
     if state.iris.is_some() {
         sources.push(json!({"id": "iris", "name": "Iris"}));
     }

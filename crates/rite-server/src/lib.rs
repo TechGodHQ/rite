@@ -3,6 +3,7 @@
 pub mod dispatch;
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -11,8 +12,8 @@ use std::{
 };
 
 use axum::{Json, Router, routing::get};
-use rite_core::{RiteAction, RiteHandler};
-use rite_sources::{github::GitHubSource, iris::IrisSource};
+use rite_core::{EventSource, RiteAction, RiteHandler};
+use rite_sources::{github::GitHubSource, iris::IrisSource, uptime_kuma::UptimeKumaSource};
 use serde::Deserialize;
 
 /// Severity emitted while checking a loaded configuration before the server starts.
@@ -47,6 +48,16 @@ pub struct RiteConfig {
 pub struct SourcesConfig {
     /// Optional Iris SSE subscription source.
     pub iris: Option<IrisConfig>,
+    /// Optional authenticated Uptime Kuma webhook source.
+    pub uptime_kuma: Option<UptimeKumaConfig>,
+}
+
+/// Uptime Kuma webhook configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UptimeKumaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub secret: String,
 }
 
 /// Iris subscription configuration.
@@ -61,7 +72,8 @@ pub struct IrisConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub handlers: Arc<Vec<RiteHandler>>,
-    pub github: Arc<GitHubSource>,
+    /// Ingress sources keyed by their stable source ID.
+    pub sources: Arc<BTreeMap<String, Arc<dyn EventSource>>>,
     pub client: reqwest::Client,
     pub iris: Option<IrisSource>,
     pub metrics: Arc<Metrics>,
@@ -113,10 +125,14 @@ pub fn load_config(input: &str) -> Result<RiteConfig, toml::de::Error> {
 #[must_use]
 pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let configured_sources = [Some("github"), config.sources.iris.as_ref().map(|_| "iris")]
-        .into_iter()
-        .flatten()
-        .collect::<std::collections::BTreeSet<_>>();
+    let configured_sources = [
+        Some("github"),
+        config.sources.iris.as_ref().map(|_| "iris"),
+        config.sources.uptime_kuma.as_ref().map(|_| "uptime_kuma"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<std::collections::BTreeSet<_>>();
 
     if config.rites.is_empty() {
         diagnostics.push(Diagnostic {
@@ -131,6 +147,16 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
         diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Error,
             message: "enabled source 'iris' has an empty base_url".into(),
+        });
+    }
+
+    if let Some(kuma) = &config.sources.uptime_kuma
+        && kuma.enabled
+        && kuma.secret.trim().is_empty()
+    {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            message: "enabled source 'uptime_kuma' has an empty secret".into(),
         });
     }
 
@@ -158,14 +184,23 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
 /// A secret-free configuration inventory for startup logs.
 #[must_use]
 pub fn startup_summary(config: &RiteConfig) -> String {
-    let source_count = 1 + usize::from(config.sources.iris.is_some());
-    let enabled_count = 1 + usize::from(
-        config
-            .sources
-            .iris
-            .as_ref()
-            .is_some_and(|source| source.enabled),
-    );
+    let source_count = 1
+        + usize::from(config.sources.iris.is_some())
+        + usize::from(config.sources.uptime_kuma.is_some());
+    let enabled_count =
+        1 + usize::from(
+            config
+                .sources
+                .iris
+                .as_ref()
+                .is_some_and(|source| source.enabled),
+        ) + usize::from(
+            config
+                .sources
+                .uptime_kuma
+                .as_ref()
+                .is_some_and(|source| source.enabled),
+        );
     format!(
         "rite: {source_count} sources ({enabled_count} enabled), {} handlers loaded",
         config.rites.len()
@@ -197,9 +232,17 @@ pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<A
         .filter(|config| config.enabled)
         .map(|config| IrisSource::new(config.base_url))
         .transpose()?;
+    let mut sources: BTreeMap<String, Arc<dyn EventSource>> = BTreeMap::new();
+    sources.insert("github".into(), Arc::new(GitHubSource::new(secret)?));
+    if let Some(kuma) = config.sources.uptime_kuma.filter(|config| config.enabled) {
+        sources.insert(
+            "uptime_kuma".into(),
+            Arc::new(UptimeKumaSource::new(kuma.secret)?),
+        );
+    }
     Ok(AppState {
         handlers: Arc::new(config.rites),
-        github: Arc::new(GitHubSource::new(secret)?),
+        sources: Arc::new(sources),
         client: reqwest::Client::new(),
         iris,
         metrics: Arc::new(Metrics::default()),
@@ -284,6 +327,14 @@ mod tests {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn kuma_signature(secret: &str, body: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
+        mac.update(body);
+        STANDARD.encode(mac.finalize().into_bytes())
     }
 
     #[test]
@@ -382,6 +433,44 @@ mod tests {
         assert_eq!(status["events_matched"], 0);
         assert_eq!(status["actions_succeeded"], 0);
         assert_eq!(status["actions_failed"], 0);
+    }
+
+    #[tokio::test]
+    async fn uptime_kuma_ingress_requires_signature_and_acks_valid_heartbeats() {
+        let config =
+            load_config("[sources.uptime_kuma]\nenabled = true\nsecret = \"kuma-secret\"\n")
+                .expect("config parses");
+        let app = app(configured_state("github-secret", config).expect("valid state"));
+        let body = br#"{"monitor":{"id":7,"name":"API"},"heartbeat":{"status":0,"msg":"connection refused"}}"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/event/uptime_kuma")
+                    .header("Signature", kuma_signature("kuma-secret", body))
+                    .body(Body::from(body.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(
+            std::str::from_utf8(&bytes)
+                .expect("utf8")
+                .contains("uptime_kuma")
+        );
+
+        let rejected = app
+            .oneshot(
+                Request::post("/event/uptime_kuma")
+                    .body(Body::from(body.as_slice()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
