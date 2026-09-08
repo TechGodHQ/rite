@@ -145,21 +145,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifies_and_normalizes_heartbeat() {
+    async fn verifies_and_normalizes_every_supported_heartbeat_status() {
         let source = UptimeKumaSource::new("secret").expect("source");
-        let body = br#"{"monitor":{"id":4,"name":"API","url":"https://api.test"},"heartbeat":{"status":0,"msg":"connection refused","ping":12,"duration":5,"time":"2026-09-06 12:00:00"}}"#;
-        let headers = headers("secret", body);
-        source
-            .verify(&headers, body)
-            .await
-            .expect("signature accepted");
-        let event = source.parse(&headers, body).await.expect("payload parses");
-        assert_eq!(event.action.as_deref(), Some("down"));
-        assert_eq!(event.severity, Severity::Critical);
-        assert_eq!(event.metadata["monitor_name"], "API");
-        assert_eq!(event.metadata["status"], "down");
-        assert_eq!(event.metadata["ping_ms"], 12);
-        assert_eq!(event.metadata["duration_ms"], 5_000.0);
+        let cases = [
+            (0, "down", Severity::Critical),
+            (1, "up", Severity::Info),
+            (2, "pending", Severity::Warning),
+            (3, "maintenance", Severity::Info),
+        ];
+
+        for (status, action, severity) in cases {
+            let body = format!(
+                r#"{{"monitor":{{"id":4,"name":"API","url":"https://api.test"}},"heartbeat":{{"status":{status},"msg":"connection refused","ping":12,"duration":5,"time":"2026-09-06 12:00:00"}}}}"#
+            );
+            let headers = headers("secret", body.as_bytes());
+            source
+                .verify(&headers, body.as_bytes())
+                .await
+                .expect("signature accepted");
+            let event = source
+                .parse(&headers, body.as_bytes())
+                .await
+                .expect("payload parses");
+
+            assert_eq!(event.source, "uptime_kuma");
+            assert_eq!(event.event_type, "heartbeat");
+            assert_eq!(event.action.as_deref(), Some(action));
+            assert_eq!(event.severity, severity);
+            assert_eq!(event.metadata["monitor_name"], "API");
+            assert_eq!(event.metadata["status"], action);
+            assert_eq!(event.metadata["ping_ms"], 12);
+            assert_eq!(event.metadata["duration_ms"], 5_000.0);
+        }
     }
 
     #[tokio::test]
