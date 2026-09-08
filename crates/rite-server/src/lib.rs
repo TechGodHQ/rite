@@ -12,7 +12,7 @@ use std::{
 };
 
 use axum::{Json, Router, routing::get};
-use rite_core::{EventSource, RiteAction, RiteHandler};
+use rite_core::{EventSource, RiteAction, RiteEvent, RiteHandler};
 use rite_sources::{github::GitHubSource, iris::IrisSource, uptime_kuma::UptimeKumaSource};
 use serde::Deserialize;
 
@@ -267,6 +267,34 @@ pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<A
     })
 }
 
+/// Builds the generic HTTP action request shared by webhook and subscription dispatch.
+///
+/// Template actions default to plain text unless the handler explicitly provides
+/// a content type; legacy actions keep their normalized-event JSON payload.
+pub(crate) fn http_post_request(
+    client: &reqwest::Client,
+    url: &url::Url,
+    headers: &BTreeMap<String, String>,
+    body_template: Option<&str>,
+    event: &RiteEvent,
+) -> reqwest::RequestBuilder {
+    let mut request = client.post(url.clone());
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    if let Some(template) = body_template {
+        if !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-type"))
+        {
+            request = request.header("content-type", "text/plain");
+        }
+        request.body(rite_core::render_template(template, event))
+    } else {
+        request.json(event)
+    }
+}
+
 /// Starts the configured Iris subscription without preventing the HTTP server from starting.
 pub fn start_iris_subscription(state: &AppState) {
     let Some(iris) = state.iris.clone() else {
@@ -295,21 +323,8 @@ pub fn start_iris_subscription(state: &AppState) {
                     headers,
                     body_template,
                 } = &handler.action;
-                let mut request = client.post(url.clone());
-                for (name, value) in headers {
-                    request = request.header(name, value);
-                }
-                if let Some(template) = body_template {
-                    if !headers
-                        .keys()
-                        .any(|name| name.eq_ignore_ascii_case("content-type"))
-                    {
-                        request = request.header("content-type", "text/plain");
-                    }
-                    request = request.body(rite_core::render_template(template, &event));
-                } else {
-                    request = request.json(&event);
-                }
+                let request =
+                    http_post_request(&client, url, headers, body_template.as_deref(), &event);
                 match request.send().await {
                     Ok(response) if response.status().is_success() => {
                         metrics.actions_succeeded.fetch_add(1, Ordering::Relaxed);
@@ -333,10 +348,15 @@ pub fn start_iris_subscription(state: &AppState) {
 mod tests {
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header},
+        extract::State,
+        http::{HeaderMap, Request, StatusCode, header},
+        routing::post,
     };
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
     use super::*;
@@ -353,6 +373,51 @@ mod tests {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
         mac.update(body);
         STANDARD.encode(mac.finalize().into_bytes())
+    }
+
+    async fn capture_request(
+        State(sender): State<mpsc::Sender<(HeaderMap, String)>>,
+        headers: HeaderMap,
+        body: String,
+    ) -> StatusCode {
+        sender
+            .send((headers, body))
+            .await
+            .expect("test receiver open");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn receiver() -> (
+        String,
+        mpsc::Receiver<(HeaderMap, String)>,
+        oneshot::Sender<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("receiver binds");
+        let address = listener.local_addr().expect("receiver address");
+        let (sender, receiver) = mpsc::channel(4);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/capture", post(capture_request))
+                    .with_state(sender),
+            )
+            .with_graceful_shutdown(async { _ = shutdown_receiver.await })
+            .await
+            .expect("receiver serves");
+        });
+        (
+            format!("http://{address}/capture"),
+            receiver,
+            shutdown_sender,
+        )
+    }
+
+    fn github_push_body() -> &'static [u8] {
+        br#"{"ref":"refs/heads/main","repository":{"name":"rite"}}"#
     }
 
     #[test]
@@ -543,6 +608,89 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn webhook_actions_send_headers_template_content_types_and_legacy_json() {
+        let (url, mut captured, shutdown) = receiver().await;
+        let config = load_config(&format!(
+            "[[rites]]\nname = \"plain\"\nsource = \"github\"\nmatch = {{ event_type = \"push\" }}\naction = {{ type = \"http_post\", url = \"{url}\", headers = {{ x_action = \"webhook\" }}, body_template = \"{{{{source}}}}:{{{{event_type}}}}\" }}\n\n[[rites]]\nname = \"explicit\"\nsource = \"github\"\nmatch = {{ event_type = \"push\" }}\naction = {{ type = \"http_post\", url = \"{url}\", headers = {{ \"content-type\" = \"application/custom\" }}, body_template = \"explicit\" }}\n\n[[rites]]\nname = \"legacy\"\nsource = \"github\"\nmatch = {{ event_type = \"push\" }}\naction = {{ type = \"http_post\", url = \"{url}\" }}"
+        ))
+        .expect("config parses");
+        let app = app(configured_state("secret", config).expect("state configures"));
+        let body = github_push_body();
+        let response = app
+            .oneshot(
+                Request::post("/event/github")
+                    .header("X-GitHub-Event", "push")
+                    .header("X-Hub-Signature-256", signature("secret", body))
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let (plain_headers, plain_body) = timeout(Duration::from_secs(1), captured.recv())
+            .await
+            .expect("plain action arrives")
+            .expect("plain request captured");
+        assert_eq!(plain_headers["x_action"], "webhook");
+        assert_eq!(plain_headers[header::CONTENT_TYPE], "text/plain");
+        assert_eq!(plain_body, "github:push");
+
+        let (explicit_headers, explicit_body) = timeout(Duration::from_secs(1), captured.recv())
+            .await
+            .expect("explicit action arrives")
+            .expect("explicit request captured");
+        assert_eq!(explicit_headers[header::CONTENT_TYPE], "application/custom");
+        assert_eq!(explicit_body, "explicit");
+
+        let (legacy_headers, legacy_body) = timeout(Duration::from_secs(1), captured.recv())
+            .await
+            .expect("legacy action arrives")
+            .expect("legacy request captured");
+        assert_eq!(legacy_headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&legacy_body).expect("legacy JSON")["source"],
+            "github"
+        );
+        shutdown.send(()).expect("receiver shuts down");
+    }
+
+    #[tokio::test]
+    async fn iris_actions_send_the_same_generic_template_request() {
+        let (action_url, mut captured, shutdown) = receiver().await;
+        let iris_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Iris listener binds");
+        let iris_address = iris_listener.local_addr().expect("Iris listener address");
+        tokio::spawn(async move {
+            let (mut socket, _) = iris_listener.accept().await.expect("Iris client connects");
+            socket
+                .write_all(concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    "event: message\r\n",
+                    "data: {\"id\":\"00000000-0000-0000-0000-000000000001\",\"thread_id\":\"00000000-0000-0000-0000-000000000002\",\"source\":\"telegram\",\"source_id\":\"42\",\"sender\":{\"source_id\":\"shiv\",\"display_name\":\"Shiv\"},\"kind\":\"text\",\"body\":\"hello\",\"timestamp\":\"2026-08-15T00:00:00Z\",\"metadata\":{}}\r\n\r\n"
+                ).as_bytes())
+                .await
+                .expect("Iris event writes");
+        });
+        let config = load_config(&format!(
+            "[sources.iris]\nenabled = true\nbase_url = \"http://{iris_address}\"\n\n[[rites]]\nname = \"iris-template\"\nsource = \"iris\"\nmatch = {{ event_type = \"text\" }}\naction = {{ type = \"http_post\", url = \"{action_url}\", headers = {{ x_action = \"iris\" }}, body_template = \"{{{{source}}}}:{{{{body}}}}\" }}"
+        ))
+        .expect("config parses");
+        let state = configured_state("secret", config).expect("state configures");
+        start_iris_subscription(&state);
+
+        let (headers, body) = timeout(Duration::from_secs(1), captured.recv())
+            .await
+            .expect("Iris action arrives")
+            .expect("Iris request captured");
+        assert_eq!(headers["x_action"], "iris");
+        assert_eq!(headers[header::CONTENT_TYPE], "text/plain");
+        assert_eq!(body, "iris:hello");
+        shutdown.send(()).expect("receiver shuts down");
     }
 
     #[tokio::test]
