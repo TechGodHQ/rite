@@ -1,3 +1,4 @@
 /target
 rite.toml
 .env
+.creed/.outputs/
