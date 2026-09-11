@@ -180,6 +180,15 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
 
     let mut names = std::collections::BTreeSet::new();
     for handler in &config.rites {
+        if let Err(error) = handler.condition_tree() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!(
+                    "handler '{}' has an invalid match table: {error}",
+                    handler.name
+                ),
+            });
+        }
         if !configured_sources.contains(handler.source.as_str()) {
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Error,
@@ -711,5 +720,70 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn example_and_readme_configs_load_and_validate() {
+        let readme = include_str!("../../../README.md");
+        let example = include_str!("../../../rite.example.toml");
+        for (label, text) in [("README.md", readme), ("rite.example.toml", example)] {
+            for fence in text.split("```toml").skip(1) {
+                let toml_text = fence.split("```").next().unwrap_or_default();
+                if !toml_text.contains("[[rites]]") {
+                    continue;
+                }
+                let config = load_config(toml_text)
+                    .unwrap_or_else(|e| panic!("{label} fence failed to parse: {e}\n{toml_text}"));
+                for handler in &config.rites {
+                    handler.condition_tree().unwrap_or_else(|e| {
+                        panic!("{label} fence has invalid match: {e}\n{toml_text}")
+                    });
+                }
+                // Config fences are intentionally partial (no sources), so
+                // unknown-source errors are expected; match-table errors are
+                // not.
+                let config_errors = validate(&config)
+                    .into_iter()
+                    .filter(|d| {
+                        d.level == DiagnosticLevel::Error && !d.message.contains("unknown source")
+                    })
+                    .count();
+                assert_eq!(
+                    config_errors, 0,
+                    "{label} fence produced validation errors:\n{toml_text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_compound_match_tables() {
+        // Malformed compound tables are rejected at load_config itself
+        // (deserialization-time validation), which is stronger than a
+        // post-load diagnostic: no caller can ever obtain them.
+        let base = "[sources.iris]\nenabled = true\nbase_url = \"http://iris.test\"\n\n";
+        for (label, matcher) in [
+            ("empty all_of", "match = { all_of = [] }"),
+            ("empty any_of", "match = { any_of = [] }"),
+            (
+                "multi-child not",
+                "match = { not = { severity = \"info\", event_type = \"chat\" } }",
+            ),
+            (
+                "operator mixed with leaf",
+                "match = { any_of = [{ severity = \"critical\" }], event_type = \"chat\" }",
+            ),
+        ] {
+            let text = format!(
+                "{base}[[rites]]\nname = \"bad-{label}\"\nsource = \"iris\"\n{matcher}\naction = {{ type = \"http_post\", url = \"https://example.test/hook\" }}"
+            );
+            let err = load_config(&text)
+                .err()
+                .unwrap_or_else(|| panic!("{label} must be rejected at load"));
+            assert!(
+                err.to_string().contains("match"),
+                "{label} error must name the match table: {err}"
+            );
+        }
     }
 }

@@ -113,6 +113,34 @@ match = { body_contains = "URGENT" }
 action = { type = "http_post", url = "https://hooks.example.test/alerts", headers = { "content-type" = "application/json" }, body_template = "{\"content\":\"{{title}}: {{body}}\"}" }
 ```
 
+## Compound matching
+
+Flat `match` tables AND every entry. For OR or negation, compose conditions
+with `all_of`, `any_of`, and `not` — arbitrarily nestable, with leaf keys
+keeping exactly the semantics above:
+
+```toml
+[[rites]]
+name = "page-on-critical"
+source = "iris"
+match = { any_of = [{ severity = "critical" }, { body_contains = "URGENT" }] }
+action = { type = "http_post", url = "https://hooks.example.test/pages" }
+
+[[rites]]
+name = "real-prs-only"
+source = "github"
+match = { all_of = [{ event_type = "pull_request" }, { not = { draft = true } }] }
+action = { type = "http_post", url = "https://hooks.example.test/reviews" }
+```
+
+`all_of` and `any_of` take arrays of condition tables and reject empty
+arrays; `not` takes a single condition table. A table mixing operators with
+other keys — or using two operators as siblings — is rejected at config load
+with an actionable error. A scalar under an operator-named key (e.g.
+`not = "draft"`) is an ordinary metadata lookup, exactly as before: the
+operator only applies to table-shaped values, so existing configurations
+never change meaning.
+
 ## Development
 
 ```bash
