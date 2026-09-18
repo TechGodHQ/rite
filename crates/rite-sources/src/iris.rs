@@ -204,6 +204,209 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn assert_inbox_notification_fixture_projection(case: &Value) {
+        let message = &case["iris_message"];
+        let expected = &case["rite_event"];
+        let event = IrisSource::parse_message(&message.to_string())
+            .unwrap_or_else(|error| panic!("fixture {} parses: {error}", case["name"]));
+
+        assert_eq!(event.source, expected["source"].as_str().unwrap());
+        assert_eq!(event.event_type, expected["event_type"].as_str().unwrap());
+        assert_eq!(
+            event.timestamp,
+            chrono::DateTime::parse_from_rfc3339(expected["timestamp"].as_str().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        );
+        assert_eq!(event.body, expected["body"].as_str().map(str::to_owned));
+        assert_eq!(event.action, expected["action"].as_str().map(str::to_owned));
+        assert_eq!(
+            serde_json::to_value(event.severity).expect("severity serializes"),
+            expected["severity"]
+        );
+        assert_eq!(event.title, expected["title"].as_str().unwrap());
+        assert_eq!(event.metadata["provider"], expected["metadata"]["provider"]);
+        assert_eq!(
+            event.metadata["source_id"],
+            expected["metadata"]["source_id"]
+        );
+        assert_eq!(event.metadata["sender"], expected["metadata"]["sender"]);
+        assert_eq!(event.metadata["kind"], expected["metadata"]["kind"]);
+        assert_eq!(event.metadata.get("message"), Some(message));
+        assert_eq!(
+            event.metadata["iris_metadata"],
+            expected["metadata"]["iris_metadata"]
+        );
+
+        for field in [
+            "schema_version",
+            "event_kind",
+            "installation_id",
+            "session_id",
+            "occurrence_id",
+            "hook_kind",
+            "direction",
+            "content_opt_in",
+        ] {
+            assert_eq!(
+                event.metadata["message"]["metadata"][field],
+                expected["metadata"]["iris_metadata"][field],
+                "fixture {} preserves the agreed {field} path",
+                case["name"]
+            );
+        }
+    }
+
+    fn inbox_notification_fixtures() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../tests/fixtures/inbox-notifications/v1/fixtures.json"
+        ))
+        .expect("inbox notification fixture JSON parses")
+    }
+
+    fn named_fixture_case<'a>(cases: &'a [Value], name: &str) -> &'a Value {
+        cases
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap_or_else(|| panic!("fixture {name} exists"))
+    }
+
+    #[test]
+    fn inbox_notification_positive_fixtures_preserve_the_agreed_iris_projection() {
+        let fixtures = inbox_notification_fixtures();
+        let positive = fixtures["positive_cases"]
+            .as_array()
+            .expect("positive fixture cases are an array");
+        assert_eq!(
+            positive.len(),
+            5,
+            "fixture matrix retains all v1 positive cases"
+        );
+        for case in positive {
+            assert_inbox_notification_fixture_projection(case);
+        }
+
+        for event_kind in ["turn_ended", "attention_required", "execution_error"] {
+            assert!(
+                positive.iter().any(|case| {
+                    case["iris_message"]["metadata"]["event_kind"] == event_kind
+                        && case["expected_selection"] == true
+                }),
+                "the complete matrix covers {event_kind}"
+            );
+        }
+        let original = positive
+            .iter()
+            .find(|case| case["name"] == "turn-ended-inbound")
+            .expect("original turn-ended case exists");
+        let same_body = named_fixture_case(
+            positive,
+            "turn-ended-inbound-identical-body-distinct-occurrence",
+        );
+        assert_eq!(
+            same_body["iris_message"]["body"],
+            original["iris_message"]["body"]
+        );
+        assert_eq!(
+            same_body["iris_message"]["metadata"]["session_id"],
+            original["iris_message"]["metadata"]["session_id"]
+        );
+        assert_ne!(
+            same_body["iris_message"]["id"],
+            original["iris_message"]["id"]
+        );
+        assert_ne!(
+            same_body["iris_message"]["source_id"],
+            original["iris_message"]["source_id"]
+        );
+        assert_ne!(
+            same_body["iris_message"]["metadata"]["occurrence_id"],
+            original["iris_message"]["metadata"]["occurrence_id"]
+        );
+        assert_eq!(
+            named_fixture_case(positive, "owner-originated-mirror-is-not-an-inbound-alert")
+                ["expected_selection"]
+                .as_bool(),
+            Some(false),
+            "owner-originated mirrors must not select as inbound alerts"
+        );
+    }
+
+    #[test]
+    fn inbox_notification_replay_fixture_preserves_identity_at_the_iris_boundary() {
+        let fixtures = inbox_notification_fixtures();
+        let positive = fixtures["positive_cases"]
+            .as_array()
+            .expect("positive fixture cases are an array");
+        let replay = fixtures["replay_cases"]
+            .as_array()
+            .expect("replay fixture cases are an array");
+        assert_eq!(replay.len(), 1, "v1 carries one complete exact-replay case");
+        for case in replay {
+            assert_inbox_notification_fixture_projection(case);
+        }
+        let original = named_fixture_case(positive, "turn-ended-inbound");
+        assert_eq!(replay[0]["expected_selection"].as_bool(), Some(true));
+        assert_eq!(
+            replay[0]["iris_message"], original["iris_message"],
+            "an exact replay retains the complete original source message"
+        );
+        assert_eq!(
+            replay[0]["receipt_context"]["prior_receipt"]["iris_message_id"],
+            original["iris_message"]["id"],
+            "receipt deduplication keys the prior durable record by stable Iris message ID"
+        );
+        assert_eq!(
+            replay[0]["receipt_context"]["expected_disposition"], "deduplicated_no_second_receipt",
+            "the stateful receipt stage, not static selection, prevents the second receipt"
+        );
+    }
+
+    #[test]
+    fn inbox_notification_negative_fixtures_fail_closed_after_real_source_parsing() {
+        let fixtures = inbox_notification_fixtures();
+        let negative = fixtures["negative_cases"]
+            .as_array()
+            .expect("negative fixture cases are an array");
+        assert_eq!(
+            negative.len(),
+            3,
+            "fixture matrix retains all v1 negative cases"
+        );
+        for case in negative {
+            assert_inbox_notification_fixture_projection(case);
+            assert_eq!(
+                case["expected_selection"].as_bool(),
+                Some(false),
+                "negative fixture {} must fail policy selection",
+                case["name"]
+            );
+        }
+        let missing_installation = named_fixture_case(negative, "missing-installation-id");
+        assert!(
+            missing_installation["iris_message"]["metadata"]
+                .get("installation_id")
+                .is_none()
+        );
+        let unsupported = named_fixture_case(negative, "unsupported-stop-failure");
+        assert_eq!(
+            unsupported["iris_message"]["metadata"]["event_kind"],
+            "stop_failure"
+        );
+        assert!(
+            unsupported["expected"]
+                .as_str()
+                .is_some_and(|expected| expected.contains("do not fabricate execution_error")),
+            "unknown event kinds must fail closed rather than become execution errors"
+        );
+        let missing_opt_in = named_fixture_case(negative, "missing-content-opt-in");
+        assert!(
+            missing_opt_in["iris_message"]["metadata"]
+                .get("content_opt_in")
+                .is_none()
+        );
+    }
+
     #[test]
     fn preserves_the_full_iris_message_for_matching() {
         let event = IrisSource::parse_message(r#"{"id":"00000000-0000-0000-0000-000000000001","thread_id":"00000000-0000-0000-0000-000000000002","source":"telegram","source_id":"42","sender":{"source_id":"shiv","display_name":"Shiv"},"kind":"text","body":"URGENT: deploy","timestamp":"2026-08-15T00:00:00Z","metadata":{"chat_id":9}}"#).expect("message parses");
