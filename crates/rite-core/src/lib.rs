@@ -12,6 +12,10 @@ use url::Url;
 /// Result type used by Rite domain operations.
 pub type Result<T> = std::result::Result<T, RiteError>;
 
+/// Stable marker for matcher errors that may safely cross a configuration-load
+/// boundary without rendering the originating TOML source text.
+pub const MATCH_VALIDATION_ERROR_PREFIX: &str = "rite matcher validation: ";
+
 /// Errors returned by Rite components.
 #[derive(Debug, Error)]
 pub enum RiteError {
@@ -116,22 +120,25 @@ pub struct RiteHandler {
 impl RiteHandler {
     /// Convert the flat TOML matcher map into a match condition tree.
     ///
-    /// Operator keys (`all_of`, `any_of`, `not`) are recognized only when
-    /// their TOML value is an inline table (compound form) or, for `not`,
-    /// exactly that; a scalar value under an operator-named key keeps its
-    /// legacy meaning as an ordinary metadata-lookup leaf, so existing
-    /// configurations never change semantics.
+    /// Operator keys are recognized only when their TOML values have the
+    /// exact compound grammar: `all_of` and `any_of` take arrays of
+    /// condition tables, while `not` takes one condition table. A scalar
+    /// under an operator-named key keeps its legacy meaning as an ordinary
+    /// metadata-lookup leaf, so existing configurations never change
+    /// semantics.
     ///
     /// # Errors
     ///
-    /// Returns a [`RiteError::Config`] when the table mixes operators with
-    /// other keys, or when `all_of`/`any_of` is empty, `not` is not a
-    /// single-child table, or any nested operand repeats a violation.
+    /// Returns a [`RiteError::Config`] when a structured value has the wrong
+    /// key or operand shape, the table mixes operators with other keys,
+    /// `all_of`/`any_of` is empty, `not` is not a single-child table, or any
+    /// nested operand repeats a violation.
     pub fn condition_tree(&self) -> Result<MatchCondition> {
         Self::tree_from_map(&self.matcher)
     }
 
     fn tree_from_map(map: &BTreeMap<String, MatchValue>) -> Result<MatchCondition> {
+        Self::validate_value_shapes(map)?;
         // Operator keys are only operators when their TOML shape matches the
         // grammar: all_of/any_of take an array of condition tables, not takes
         // a single condition table. A scalar under an operator-named key is a
@@ -164,6 +171,38 @@ impl RiteHandler {
             "any_of" => Self::children_of(map, "any_of", false),
             _ => Self::children_of(map, "not", true),
         }
+    }
+
+    fn validate_value_shapes(map: &BTreeMap<String, MatchValue>) -> Result<()> {
+        for (key, value) in map {
+            match (key.as_str(), value) {
+                ("all_of" | "any_of", MatchValue::Array(_))
+                | ("not", MatchValue::Table(_))
+                | (_, MatchValue::String(_) | MatchValue::Integer(_) | MatchValue::Boolean(_)) => {}
+                ("all_of" | "any_of", MatchValue::Table(_)) => {
+                    return Err(RiteError::Config(format!(
+                        "match operator '{key}' requires an array of condition tables, not an inline table"
+                    )));
+                }
+                ("not", MatchValue::Array(_)) => {
+                    return Err(RiteError::Config(
+                        "match operator 'not' requires an inline table holding exactly one child condition, not an array"
+                            .into(),
+                    ));
+                }
+                (_, MatchValue::Table(_)) => {
+                    return Err(RiteError::Config(format!(
+                        "match key '{key}' requires a scalar string, integer, or boolean; inline tables are only valid as the operand of 'not'"
+                    )));
+                }
+                (_, MatchValue::Array(_)) => {
+                    return Err(RiteError::Config(format!(
+                        "match key '{key}' requires a scalar string, integer, or boolean; arrays are only valid as operands of 'all_of' or 'any_of'"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn children_of(
@@ -236,14 +275,17 @@ where
     let map = BTreeMap::<String, MatchValue>::deserialize(deserializer)?;
     RiteHandler::tree_from_map(&map)
         .map(|_| map)
-        .map_err(serde::de::Error::custom)
+        .map_err(|error| {
+            serde::de::Error::custom(format!("{MATCH_VALIDATION_ERROR_PREFIX}{error}"))
+        })
 }
 
 /// A scalar value used to match an event field or metadata item.
 ///
-/// The `Table` and `Array` variants only appear inside compound
-/// (`all_of`/`any_of`/`not`) match tables; legacy flat matchers keep their
-/// scalar shapes verbatim.
+/// The `Table` and `Array` variants only appear in their declared compound
+/// positions: `Table` for `not`, `Array` for `all_of`/`any_of`. Legacy flat
+/// matchers keep scalar shapes verbatim, and unsupported structured values
+/// are rejected at deserialization time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MatchValue {
@@ -542,6 +584,10 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
 
     const ACTION: &str = "action = { type = \"http_post\", url = \"https://example.test/hook\" }";
 
+    fn handler_with_match(matcher: &str) -> String {
+        format!("name = \"match-shape\"\nsource = \"iris\"\n{matcher}\n{ACTION}")
+    }
+
     #[test]
     fn compound_any_of_matches_exactly_critical_or_urgent() {
         let handler: RiteHandler = toml::from_str(&format!(
@@ -636,7 +682,7 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
         // A scalar under an operator-named key is a metadata lookup, not an
         // operator — legacy configs using those exact key names keep working.
         let handler: RiteHandler = toml::from_str(&format!(
-            "name = \"legacy-named\"\nsource = \"iris\"\nmatch = {{ not = \"a-value\", all_of = \"another\", event_type = \"text\" }}\n{ACTION}"
+            "name = \"legacy-named\"\nsource = \"iris\"\nmatch = {{ not = \"a-value\", all_of = \"another\", any_of = true, event_type = \"text\" }}\n{ACTION}"
         ))
         .expect("legacy scalar handler parses");
 
@@ -644,7 +690,7 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
         let MatchCondition::All(children) = tree else {
             panic!("scalar operator-named keys must parse to All");
         };
-        assert_eq!(children.len(), 3);
+        assert_eq!(children.len(), 4);
 
         let matching = event(
             "iris",
@@ -654,9 +700,32 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
             BTreeMap::from([
                 ("not".into(), Value::String("a-value".into())),
                 ("all_of".into(), Value::String("another".into())),
+                ("any_of".into(), Value::Bool(true)),
             ]),
         );
         assert!(handler.matches(&matching));
+    }
+
+    #[test]
+    fn omitted_and_empty_legacy_matchers_remain_valid() {
+        let omitted = toml::from_str::<RiteHandler>(&format!(
+            "name = \"omitted\"\nsource = \"iris\"\n{ACTION}"
+        ))
+        .expect("omitted matcher parses");
+        let empty = toml::from_str::<RiteHandler>(&handler_with_match("match = {}"))
+            .expect("empty matcher parses");
+        let event = event("iris", "text", Severity::Info, None, BTreeMap::new());
+
+        assert!(matches!(
+            omitted.condition_tree().expect("omitted tree"),
+            MatchCondition::All(children) if children.is_empty()
+        ));
+        assert!(matches!(
+            empty.condition_tree().expect("empty tree"),
+            MatchCondition::All(children) if children.is_empty()
+        ));
+        assert!(omitted.matches(&event));
+        assert!(empty.matches(&event));
     }
 
     #[test]
@@ -701,6 +770,82 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
         ))
         .expect_err("sibling operators rejected at load");
         assert!(siblings.to_string().contains("multiple operators"));
+    }
+
+    #[test]
+    fn compound_rejects_wrong_structured_operand_shapes_at_load() {
+        for (label, matcher, key) in [
+            (
+                "all_of table",
+                "match = { all_of = { event_type = \"push\" } }",
+                "all_of",
+            ),
+            (
+                "any_of table",
+                "match = { any_of = { event_type = \"push\" } }",
+                "any_of",
+            ),
+            (
+                "not array",
+                "match = { not = [{ event_type = \"push\" }] }",
+                "not",
+            ),
+        ] {
+            let error = toml::from_str::<RiteHandler>(&handler_with_match(matcher))
+                .expect_err(&format!("{label} must be rejected at load"));
+            assert!(
+                error.to_string().contains(key),
+                "{label} diagnostic must name its match key: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn compound_rejects_structured_leaves_and_nested_wrong_shapes_at_load() {
+        for (label, matcher, key) in [
+            (
+                "ordinary table leaf",
+                "match = { metadata = { channel = \"alerts\" } }",
+                "metadata",
+            ),
+            (
+                "ordinary array leaf",
+                "match = { labels = [{ channel = \"alerts\" }] }",
+                "labels",
+            ),
+            (
+                "ordinary table leaf under not",
+                "match = { not = { metadata = { channel = \"alerts\" } } }",
+                "metadata",
+            ),
+            (
+                "ordinary array leaf under any_of",
+                "match = { any_of = [{ labels = [{ channel = \"alerts\" }] }] }",
+                "labels",
+            ),
+            (
+                "wrong all_of shape under not",
+                "match = { not = { all_of = { event_type = \"push\" } } }",
+                "all_of",
+            ),
+            (
+                "wrong any_of shape under all_of",
+                "match = { all_of = [{ any_of = { event_type = \"push\" } }] }",
+                "any_of",
+            ),
+            (
+                "wrong not shape under any_of",
+                "match = { any_of = [{ not = [{ event_type = \"push\" }] }] }",
+                "not",
+            ),
+        ] {
+            let error = toml::from_str::<RiteHandler>(&handler_with_match(matcher))
+                .expect_err(&format!("{label} must be rejected at load"));
+            assert!(
+                error.to_string().contains(key),
+                "{label} diagnostic must name its match key: {error}"
+            );
+        }
     }
 
     #[test]
