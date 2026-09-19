@@ -81,7 +81,7 @@ impl OperationError {
 /// The single dispatch every generated surface funnels through.
 ///
 /// Operation helpers stay `async` so arms can await real I/O; the current
-/// three are pure reads.
+/// generated reads are pure snapshots/configuration queries.
 ///
 /// # Errors
 ///
@@ -95,6 +95,7 @@ pub async fn execute_operation(
     match operation {
         "list_sources" => list_sources(state).await,
         "list_handlers" => list_handlers(state).await,
+        "get_status" => Ok(crate::status_snapshot(state)),
         "get_handler" => {
             let handler_id = input
                 .path

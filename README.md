@@ -40,9 +40,22 @@ RITE_GITHUB_WEBHOOK_SECRET=change-me cargo run -p rite-cli -- --config rite.toml
 Endpoints:
 
 - `GET /health` — returns `ok`
+- `GET /status` — live process-local event/action counters (HTTP-only)
 - `GET /sources` — configured source adapters
 - `POST /event/github` — authenticated GitHub webhook ingress using `X-Hub-Signature-256`
 - `POST /event/uptime_kuma` — authenticated Uptime Kuma webhook ingress using base64 `Signature` HMAC-SHA256
+
+### Process status
+
+`GET /status` returns a JSON snapshot from the running Rite process with exactly
+these fields: `events_received`, `events_matched`, `actions_succeeded`,
+`actions_failed`, `uptime_seconds`, and `handlers_loaded`. The counters and
+uptime are process-local and reset when Rite restarts; they are not persisted,
+aggregated, or a view into another running server.
+
+Status is intentionally HTTP-only. `rite-cli` reads local configuration rather
+than connecting to a running server, so it does not expose potentially
+misleading live metrics; the MCP manifest likewise has no status tool.
 
 ## CLI and MCP
 

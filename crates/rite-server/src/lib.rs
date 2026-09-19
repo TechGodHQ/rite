@@ -11,7 +11,7 @@ use std::{
     time::Instant,
 };
 
-use axum::{Json, Router, routing::get};
+use axum::{Router, routing::get};
 use rite_core::{EventSource, RiteAction, RiteEvent, RiteHandler};
 use rite_sources::{github::GitHubSource, iris::IrisSource, uptime_kuma::UptimeKumaSource};
 use serde::Deserialize;
@@ -113,7 +113,6 @@ impl Default for Metrics {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/status", get(status))
         .merge(dispatch::generated::generated_router())
         .with_state(state)
 }
@@ -238,17 +237,18 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn status(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+/// Return the live, process-local metric snapshot shared by every public
+/// surface that can truthfully address the running server.
+#[must_use]
+pub(crate) fn status_snapshot(state: &AppState) -> serde_json::Value {
+    serde_json::json!({
         "events_received": state.metrics.events_received.load(Ordering::Relaxed),
         "events_matched": state.metrics.events_matched.load(Ordering::Relaxed),
         "actions_succeeded": state.metrics.actions_succeeded.load(Ordering::Relaxed),
         "actions_failed": state.metrics.actions_failed.load(Ordering::Relaxed),
         "uptime_seconds": state.metrics.started_at.elapsed().as_secs(),
         "handlers_loaded": state.handlers.len(),
-    }))
+    })
 }
 
 /// Builds state with a GitHub source and TOML-configured handlers.
@@ -363,6 +363,7 @@ mod tests {
     };
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+    use std::collections::BTreeSet;
     use tokio::io::AsyncWriteExt;
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::{Duration, timeout};
@@ -382,6 +383,27 @@ mod tests {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
         mac.update(body);
         STANDARD.encode(mac.finalize().into_bytes())
+    }
+
+    fn assert_status_schema(status: &serde_json::Value) {
+        let object = status.as_object().expect("status is an object");
+        let keys = object.keys().cloned().collect::<BTreeSet<_>>();
+        let expected = [
+            "actions_failed",
+            "actions_succeeded",
+            "events_matched",
+            "events_received",
+            "handlers_loaded",
+            "uptime_seconds",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<BTreeSet<_>>();
+        assert_eq!(keys, expected);
+        assert!(
+            object.values().all(serde_json::Value::is_u64),
+            "every status value is a nonnegative integer: {status}"
+        );
     }
 
     async fn capture_request(
@@ -485,6 +507,36 @@ mod tests {
             .expect("response");
         assert_eq!(health.status(), StatusCode::OK);
 
+        let before = app
+            .clone()
+            .oneshot(
+                Request::get("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(before.status(), StatusCode::OK);
+        assert!(
+            before
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("JSON content type")
+                .to_str()
+                .expect("valid content type")
+                .starts_with("application/json")
+        );
+        let before = to_bytes(before.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let before: serde_json::Value = serde_json::from_slice(&before).expect("json");
+        assert_status_schema(&before);
+        assert_eq!(before["events_received"], 0);
+        assert_eq!(before["events_matched"], 0);
+        assert_eq!(before["actions_succeeded"], 0);
+        assert_eq!(before["actions_failed"], 0);
+        assert_eq!(before["handlers_loaded"], 0);
+
         let body = br#"{"ref":"refs/heads/main","repository":{"name":"rite"}}"#;
         let response = app
             .clone()
@@ -521,10 +573,124 @@ mod tests {
             .await
             .expect("body");
         let status: serde_json::Value = serde_json::from_slice(&status).expect("json");
+        assert_status_schema(&status);
         assert_eq!(status["events_received"], 1);
         assert_eq!(status["events_matched"], 0);
         assert_eq!(status["actions_succeeded"], 0);
         assert_eq!(status["actions_failed"], 0);
+        assert_eq!(status["handlers_loaded"], 0);
+    }
+
+    #[tokio::test]
+    async fn generated_status_route_and_shared_dispatch_report_same_live_metrics() {
+        let config = load_config(
+            "[[rites]]\nname = \"status-handler\"\nsource = \"github\"\nmatch = { event_type = \"push\" }\naction = { type = \"http_post\", url = \"http://127.0.0.1:9\" }\n",
+        )
+        .expect("config parses");
+        let state = configured_state("secret", config).expect("state configures");
+        state
+            .metrics
+            .events_received
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .events_matched
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .actions_succeeded
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .actions_failed
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let dispatched = crate::dispatch::execute_operation(
+            &state,
+            "get_status",
+            crate::dispatch::OperationInput::default(),
+        )
+        .await
+        .expect("generated operation succeeds");
+        assert_status_schema(&dispatched);
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::get("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("JSON content type")
+                .to_str()
+                .expect("valid content type")
+                .starts_with("application/json")
+        );
+        let response = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let routed: serde_json::Value = serde_json::from_slice(&response).expect("json");
+        assert_status_schema(&routed);
+
+        for field in [
+            "events_received",
+            "events_matched",
+            "actions_succeeded",
+            "actions_failed",
+            "handlers_loaded",
+        ] {
+            assert_eq!(routed[field], dispatched[field], "field {field}");
+        }
+        let dispatched_uptime = dispatched["uptime_seconds"]
+            .as_u64()
+            .expect("dispatch uptime is an integer");
+        let routed_uptime = routed["uptime_seconds"]
+            .as_u64()
+            .expect("route uptime is an integer");
+        assert!(
+            routed_uptime >= dispatched_uptime,
+            "uptime can advance between snapshots"
+        );
+        assert_eq!(routed["events_received"], 7);
+        assert_eq!(routed["events_matched"], 5);
+        assert_eq!(routed["actions_succeeded"], 3);
+        assert_eq!(routed["actions_failed"], 2);
+        assert_eq!(routed["handlers_loaded"], 1);
+    }
+
+    #[test]
+    fn status_route_is_generated_and_health_is_the_only_handwritten_app_route() {
+        let status_routes = crate::dispatch::generated::GENERATED_ROUTES
+            .iter()
+            .filter(|route| route.name == "get_status")
+            .collect::<Vec<_>>();
+        assert_eq!(status_routes.len(), 1);
+        assert_eq!(status_routes[0].method, "GET");
+        assert_eq!(status_routes[0].path, "/status");
+
+        let source = include_str!("lib.rs");
+        let app_body = source
+            .split("pub fn app")
+            .nth(1)
+            .and_then(|remainder| remainder.split("/// Parse handler configuration").next())
+            .expect("app body remains delimited by its following API docs");
+        assert!(app_body.contains(".route(\"/health\", get(health))"));
+        assert_eq!(
+            app_body.matches(".route(").count(),
+            1,
+            "only /health may be registered by hand"
+        );
+        let status_registration = format!(".route(\"/{}", "status");
+        assert!(
+            !app_body.contains(&status_registration),
+            "/status must remain owned by generated routing"
+        );
     }
 
     #[tokio::test]
