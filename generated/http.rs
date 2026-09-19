@@ -41,6 +41,7 @@ pub const GENERATED_ROUTES: &[GeneratedRoute] = &[
     GeneratedRoute { name: "list_sources", method: "GET", path: "/sources" },
     GeneratedRoute { name: "list_handlers", method: "GET", path: "/handlers" },
     GeneratedRoute { name: "get_handler", method: "GET", path: "/handlers/{handler_id}" },
+    GeneratedRoute { name: "get_status", method: "GET", path: "/status" },
     GeneratedRoute { name: "receive_event", method: "POST", path: "/event/{source}" },
 ];
 
@@ -49,6 +50,7 @@ pub fn generated_router() -> Router<crate::AppState> {
         .route("/sources", get(list_sources))
         .route("/handlers", get(list_handlers))
         .route("/handlers/{handler_id}", get(get_handler))
+        .route("/status", get(get_status))
         .route("/event/{source}", post(receive_event))
 }
 
@@ -91,6 +93,21 @@ async fn get_handler(
         "get_handler",
         GeneratedOperationInput {
             path,
+            query: BTreeMap::new(),
+            body: Value::Null,
+        },
+    )
+    .await
+}
+
+async fn get_status(
+    State(state): State<crate::AppState>,
+) -> Response {
+    crate::dispatch::execute_operation_http(
+        &state,
+        "get_status",
+        GeneratedOperationInput {
+            path: BTreeMap::new(),
             query: BTreeMap::new(),
             body: Value::Null,
         },

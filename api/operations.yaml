@@ -28,6 +28,14 @@ operations:
         type: string
         required: true
         location: path
+  - name: get_status
+    description: Get live process-local counters for the running Rite server; values reset when it restarts.
+    method: GET
+    path: /status
+    read: true
+    output_type: Value
+    parameters: []
+    surfaces: [http]
   - name: receive_event
     description: Receive a raw webhook delivery for HMAC-verified event ingress.
     method: POST
