@@ -146,12 +146,14 @@ match = { all_of = [{ event_type = "pull_request" }, { not = { draft = true } }]
 action = { type = "http_post", url = "https://hooks.example.test/reviews" }
 ```
 
-`all_of` and `any_of` take arrays of condition tables and reject empty
-arrays; `not` takes a single condition table. A table mixing operators with
-other keys — or using two operators as siblings — is rejected at config load
-with an actionable error. A scalar under an operator-named key (e.g.
-`not = "draft"`) is an ordinary metadata lookup, exactly as before: the
-operator only applies to table-shaped values, so existing configurations
+`all_of` and `any_of` take nonempty arrays of condition tables; `not` takes
+one condition table. A table mixing operators with other keys — or using two
+operators as siblings — is rejected at config load with an actionable error.
+Structured values must use their declared grammar: an inline table under
+`all_of`/`any_of`, an array under `not`, or any table/array under an ordinary
+leaf key is rejected rather than silently becoming a non-matching leaf. A
+scalar under an operator-named key (for example, `not = "draft"`) remains an
+ordinary metadata lookup exactly as before, so existing scalar configurations
 never change meaning.
 
 ## Development

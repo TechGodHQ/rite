@@ -12,7 +12,7 @@ use std::{
 };
 
 use axum::{Router, routing::get};
-use rite_core::{EventSource, RiteAction, RiteEvent, RiteHandler};
+use rite_core::{EventSource, MATCH_VALIDATION_ERROR_PREFIX, RiteAction, RiteEvent, RiteHandler};
 use rite_sources::{github::GitHubSource, iris::IrisSource, uptime_kuma::UptimeKumaSource};
 use serde::Deserialize;
 
@@ -117,9 +117,39 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Parse handler configuration from TOML text.
-pub fn load_config(input: &str) -> Result<RiteConfig, toml::de::Error> {
-    toml::from_str(input)
+/// A configuration-load failure safe to display in CLI output and logs.
+///
+/// Parser errors can retain a copy of their complete source document for span
+/// rendering. This type deliberately retains only a known-safe matcher
+/// diagnostic or a generic parse/type error, never raw TOML values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLoadError(String);
+
+impl ConfigLoadError {
+    fn from_toml(error: &toml::de::Error) -> Self {
+        let message = error.message();
+        let safe_message = message
+            .strip_prefix(MATCH_VALIDATION_ERROR_PREFIX)
+            .map_or_else(
+                || "configuration syntax or value type is invalid".to_owned(),
+                ToOwned::to_owned,
+            );
+        Self(safe_message)
+    }
+}
+
+impl std::fmt::Display for ConfigLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid Rite configuration: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConfigLoadError {}
+
+/// Parse handler configuration from TOML text without retaining raw input in
+/// user-facing errors.
+pub fn load_config(input: &str) -> Result<RiteConfig, ConfigLoadError> {
+    toml::from_str(input).map_err(|error| ConfigLoadError::from_toml(&error))
 }
 
 /// Validate configuration without performing network or filesystem I/O.
@@ -892,34 +922,101 @@ mod tests {
     fn example_and_readme_configs_load_and_validate() {
         let readme = include_str!("../../../README.md");
         let example = include_str!("../../../rite.example.toml");
-        for (label, text) in [("README.md", readme), ("rite.example.toml", example)] {
-            for fence in text.split("```toml").skip(1) {
-                let toml_text = fence.split("```").next().unwrap_or_default();
-                if !toml_text.contains("[[rites]]") {
-                    continue;
-                }
-                let config = load_config(toml_text)
-                    .unwrap_or_else(|e| panic!("{label} fence failed to parse: {e}\n{toml_text}"));
-                for handler in &config.rites {
-                    handler.condition_tree().unwrap_or_else(|e| {
-                        panic!("{label} fence has invalid match: {e}\n{toml_text}")
-                    });
-                }
-                // Config fences are intentionally partial (no sources), so
-                // unknown-source errors are expected; match-table errors are
-                // not.
-                let config_errors = validate(&config)
-                    .into_iter()
-                    .filter(|d| {
-                        d.level == DiagnosticLevel::Error && !d.message.contains("unknown source")
-                    })
-                    .count();
-                assert_eq!(
-                    config_errors, 0,
-                    "{label} fence produced validation errors:\n{toml_text}"
-                );
+        let example_config = load_config(example)
+            .unwrap_or_else(|e| panic!("rite.example.toml failed to parse: {e}"));
+        let example_names = example_config
+            .rites
+            .iter()
+            .map(|handler| handler.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(example_names, ["github-pr-opened", "discord-urgent-alert"]);
+        assert!(
+            validate(&example_config)
+                .iter()
+                .all(|diagnostic| diagnostic.level != DiagnosticLevel::Error),
+            "rite.example.toml must validate without errors"
+        );
+        let malformed_example = example.replacen(
+            "match = { event_type = \"pull_request\", action = \"opened\" }",
+            "match = { all_of = { event_type = \"pull_request\" } }",
+            1,
+        );
+        assert!(
+            load_config(&malformed_example).is_err(),
+            "fixture validation must exercise the real loader"
+        );
+
+        let readme_configs = readme
+            .split("```toml")
+            .skip(1)
+            .filter_map(|fence| fence.split("```").next())
+            .filter(|toml_text| toml_text.contains("[[rites]]"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            readme_configs.len(),
+            3,
+            "expected three handler TOML examples"
+        );
+        for toml_text in readme_configs {
+            let config = load_config(toml_text)
+                .unwrap_or_else(|e| panic!("README.md fence failed to parse: {e}\n{toml_text}"));
+            assert!(
+                !config.rites.is_empty(),
+                "README handler fence must be nonempty"
+            );
+            for handler in &config.rites {
+                handler.condition_tree().unwrap_or_else(|e| {
+                    panic!("README.md fence has invalid match: {e}\n{toml_text}")
+                });
             }
+            // README fences deliberately omit source definitions when the
+            // example is about a handler alone. No other validation error is
+            // acceptable.
+            let unexpected_errors = validate(&config)
+                .into_iter()
+                .filter(|diagnostic| {
+                    diagnostic.level == DiagnosticLevel::Error
+                        && !diagnostic.message.contains("unknown source")
+                })
+                .count();
+            assert_eq!(
+                unexpected_errors, 0,
+                "README.md fence produced validation errors:\n{toml_text}"
+            );
         }
+    }
+
+    #[test]
+    fn load_config_redacts_source_values_but_keeps_match_diagnostics() {
+        let malformed_match = r#"
+[[rites]]
+name = "unsafe-match"
+source = "iris"
+match = { labels = [{ category = "alerts" }] }
+action = { type = "http_post", url = "https://example.test/hook", headers = { authorization = "synthetic-config-marker" } }
+"#;
+        let match_error = load_config(malformed_match).expect_err("bad match must not load");
+        let match_message = match_error.to_string();
+        assert!(
+            match_message.contains("labels"),
+            "safe matcher diagnostic must name the invalid key: {match_message}"
+        );
+        assert!(
+            !match_message.contains("synthetic-config-marker"),
+            "matcher load errors must never render raw config values"
+        );
+
+        let malformed_type = r#"
+[[rites]]
+name = "unsafe-type"
+source = { token = "synthetic-config-marker" }
+action = { type = "http_post", url = "https://example.test/hook" }
+"#;
+        let type_error = load_config(malformed_type).expect_err("bad source type must not load");
+        assert!(
+            !type_error.to_string().contains("synthetic-config-marker"),
+            "generic parser errors must never render raw config values"
+        );
     }
 
     #[test]
@@ -931,6 +1028,27 @@ mod tests {
         for (label, matcher) in [
             ("empty all_of", "match = { all_of = [] }"),
             ("empty any_of", "match = { any_of = [] }"),
+            (
+                "all_of table",
+                "match = { all_of = { event_type = \"chat\" } }",
+            ),
+            (
+                "any_of table",
+                "match = { any_of = { event_type = \"chat\" } }",
+            ),
+            ("not array", "match = { not = [{ event_type = \"chat\" }] }"),
+            (
+                "ordinary structured leaf",
+                "match = { metadata = { event_type = \"chat\" } }",
+            ),
+            (
+                "nested ordinary structured leaf",
+                "match = { any_of = [{ labels = [{ event_type = \"chat\" }] }] }",
+            ),
+            (
+                "nested malformed negation",
+                "match = { not = { all_of = { event_type = \"chat\" } } }",
+            ),
             (
                 "multi-child not",
                 "match = { not = { severity = \"info\", event_type = \"chat\" } }",
