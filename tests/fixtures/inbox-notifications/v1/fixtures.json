@@ -1,0 +1,548 @@
+{
+  "contract": "inbox-notifications/v1",
+  "schema_version": 1,
+  "positive_cases": [
+    {
+      "name": "turn-ended-inbound",
+      "expected_selection": true,
+      "iris_message": {
+        "id": "11111111-1111-5111-8111-111111111111",
+        "thread_id": "22222222-2222-5222-8222-222222222222",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/dHVybi1lbmRlZC1hbHBoYQ",
+        "sender": {
+          "id": "33333333-3333-5333-8333-333333333333",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWFscGhh",
+          "source_id": "agent-build",
+          "display_name": "Build agent",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic task turn completed.",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:00:00Z",
+        "is_outbound": false,
+        "metadata": {
+          "schema_version": 1,
+          "installation_id": "synthetic-alpha",
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-001",
+          "hook_kind": "turn_ended",
+          "event_kind": "turn_ended",
+          "direction": "inbound",
+          "content_opt_in": true
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:00:00Z",
+        "severity": "info",
+        "title": "Build agent",
+        "body": "Synthetic task turn completed.",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/dHVybi1lbmRlZC1hbHBoYQ",
+          "sender": "agent-build",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "installation_id": "synthetic-alpha",
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-001",
+            "hook_kind": "turn_ended",
+            "event_kind": "turn_ended",
+            "direction": "inbound",
+            "content_opt_in": true
+          }
+        }
+      }
+    },
+    {
+      "name": "attention-required-multiline",
+      "expected_selection": true,
+      "iris_message": {
+        "id": "44444444-4444-5444-8444-444444444444",
+        "thread_id": "22222222-2222-5222-8222-222222222222",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/YXR0ZW50aW9uLWFscGhh",
+        "sender": {
+          "id": "33333333-3333-5333-8333-333333333333",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWFscGhh",
+          "source_id": "agent-build",
+          "display_name": "Build agent",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic attention required:\n\"choose a safe option\"",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:01:00Z",
+        "is_outbound": false,
+        "metadata": {
+          "schema_version": 1,
+          "installation_id": "synthetic-alpha",
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-002",
+          "hook_kind": "attention_required",
+          "event_kind": "attention_required",
+          "direction": "inbound",
+          "content_opt_in": true
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:01:00Z",
+        "severity": "info",
+        "title": "Build agent",
+        "body": "Synthetic attention required:\n\"choose a safe option\"",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/YXR0ZW50aW9uLWFscGhh",
+          "sender": "agent-build",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "installation_id": "synthetic-alpha",
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-002",
+            "hook_kind": "attention_required",
+            "event_kind": "attention_required",
+            "direction": "inbound",
+            "content_opt_in": true
+          }
+        }
+      }
+    },
+    {
+      "name": "execution-error-second-installation-same-session",
+      "expected_selection": true,
+      "iris_message": {
+        "id": "55555555-5555-5555-8555-555555555555",
+        "thread_id": "66666666-6666-5666-8666-666666666666",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/ZXJyb3ItYmV0YQ",
+        "sender": {
+          "id": "77777777-7777-5777-8777-777777777777",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWJldGE",
+          "source_id": "agent-build",
+          "display_name": "Build agent",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic execution error.",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:00:00Z",
+        "is_outbound": false,
+        "metadata": {
+          "schema_version": 1,
+          "installation_id": "synthetic-beta",
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-001",
+          "hook_kind": "execution_error",
+          "event_kind": "execution_error",
+          "direction": "inbound",
+          "content_opt_in": true
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:00:00Z",
+        "severity": "info",
+        "title": "Build agent",
+        "body": "Synthetic execution error.",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/ZXJyb3ItYmV0YQ",
+          "sender": "agent-build",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "installation_id": "synthetic-beta",
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-001",
+            "hook_kind": "execution_error",
+            "event_kind": "execution_error",
+            "direction": "inbound",
+            "content_opt_in": true
+          }
+        }
+      }
+    },
+    {
+      "name": "owner-originated-mirror-is-not-an-inbound-alert",
+      "expected_selection": false,
+      "iris_message": {
+        "id": "88888888-8888-5888-8888-888888888888",
+        "thread_id": "22222222-2222-5222-8222-222222222222",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/bWlycm9yLWFscGhh",
+        "sender": {
+          "id": "99999999-9999-5999-8999-999999999999",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWFscGhh",
+          "source_id": "iris-owner",
+          "display_name": "Iris owner",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic mirrored owner message.",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:02:00Z",
+        "is_outbound": true,
+        "metadata": {
+          "schema_version": 1,
+          "installation_id": "synthetic-alpha",
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-003",
+          "hook_kind": "turn_ended",
+          "event_kind": "turn_ended",
+          "direction": "owner_originated",
+          "content_opt_in": true
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:02:00Z",
+        "severity": "info",
+        "title": "Iris owner",
+        "body": "Synthetic mirrored owner message.",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/bWlycm9yLWFscGhh",
+          "sender": "iris-owner",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "installation_id": "synthetic-alpha",
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-003",
+            "hook_kind": "turn_ended",
+            "event_kind": "turn_ended",
+            "direction": "owner_originated",
+            "content_opt_in": true
+          }
+        }
+      }
+    },
+    {
+      "name": "turn-ended-inbound-identical-body-distinct-occurrence",
+      "expected_selection": true,
+      "iris_message": {
+        "id": "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa",
+        "thread_id": "22222222-2222-5222-8222-222222222222",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/c2FtZS1ib2R5LW9jYy0wMDQ",
+        "sender": {
+          "id": "33333333-3333-5333-8333-333333333333",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWFscGhh",
+          "source_id": "agent-build",
+          "display_name": "Build agent",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic task turn completed.",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:03:00Z",
+        "is_outbound": false,
+        "metadata": {
+          "schema_version": 1,
+          "installation_id": "synthetic-alpha",
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-004",
+          "hook_kind": "turn_ended",
+          "event_kind": "turn_ended",
+          "direction": "inbound",
+          "content_opt_in": true
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:03:00Z",
+        "severity": "info",
+        "title": "Build agent",
+        "body": "Synthetic task turn completed.",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/c2FtZS1ib2R5LW9jYy0wMDQ",
+          "sender": "agent-build",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "installation_id": "synthetic-alpha",
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-004",
+            "hook_kind": "turn_ended",
+            "event_kind": "turn_ended",
+            "direction": "inbound",
+            "content_opt_in": true
+          }
+        }
+      }
+    }
+  ],
+  "negative_cases": [
+    {
+      "name": "missing-installation-id",
+      "expected_selection": false,
+      "iris_message": {
+        "id": "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb",
+        "thread_id": "22222222-2222-5222-8222-222222222222",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/bWlzc2luZy1pbnN0YWxsYXRpb24",
+        "sender": {
+          "id": "33333333-3333-5333-8333-333333333333",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWFscGhh",
+          "source_id": "agent-build",
+          "display_name": "Build agent",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic task turn completed.",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:00:00Z",
+        "is_outbound": false,
+        "metadata": {
+          "schema_version": 1,
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-001",
+          "hook_kind": "turn_ended",
+          "event_kind": "turn_ended",
+          "direction": "inbound",
+          "content_opt_in": true
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:00:00Z",
+        "severity": "info",
+        "title": "Build agent",
+        "body": "Synthetic task turn completed.",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/bWlzc2luZy1pbnN0YWxsYXRpb24",
+          "sender": "agent-build",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-001",
+            "hook_kind": "turn_ended",
+            "event_kind": "turn_ended",
+            "direction": "inbound",
+            "content_opt_in": true
+          }
+        }
+      },
+      "expected": "fail closed before handler selection"
+    },
+    {
+      "name": "unsupported-stop-failure",
+      "expected_selection": false,
+      "iris_message": {
+        "id": "cccccccc-cccc-5ccc-8ccc-cccccccccccc",
+        "thread_id": "22222222-2222-5222-8222-222222222222",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/c3RvcC1mYWlsdXJl",
+        "sender": {
+          "id": "33333333-3333-5333-8333-333333333333",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWFscGhh",
+          "source_id": "agent-build",
+          "display_name": "Build agent",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic task turn completed.",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:00:00Z",
+        "is_outbound": false,
+        "metadata": {
+          "schema_version": 1,
+          "installation_id": "synthetic-alpha",
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-stop-failure",
+          "hook_kind": "stop_failure",
+          "event_kind": "stop_failure",
+          "direction": "inbound",
+          "content_opt_in": true
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:00:00Z",
+        "severity": "info",
+        "title": "Build agent",
+        "body": "Synthetic task turn completed.",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/c3RvcC1mYWlsdXJl",
+          "sender": "agent-build",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "installation_id": "synthetic-alpha",
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-stop-failure",
+            "hook_kind": "stop_failure",
+            "event_kind": "stop_failure",
+            "direction": "inbound",
+            "content_opt_in": true
+          }
+        }
+      },
+      "expected": "do not fabricate execution_error; fail selection"
+    },
+    {
+      "name": "missing-content-opt-in",
+      "expected_selection": false,
+      "iris_message": {
+        "id": "dddddddd-dddd-5ddd-8ddd-dddddddddddd",
+        "thread_id": "22222222-2222-5222-8222-222222222222",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/bWlzc2luZy1vcHQtaW4",
+        "sender": {
+          "id": "33333333-3333-5333-8333-333333333333",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWFscGhh",
+          "source_id": "agent-build",
+          "display_name": "Build agent",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic task turn completed.",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:00:00Z",
+        "is_outbound": false,
+        "metadata": {
+          "schema_version": 1,
+          "installation_id": "synthetic-alpha",
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-no-opt-in",
+          "hook_kind": "turn_ended",
+          "event_kind": "turn_ended",
+          "direction": "inbound"
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:00:00Z",
+        "severity": "info",
+        "title": "Build agent",
+        "body": "Synthetic task turn completed.",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/bWlzc2luZy1vcHQtaW4",
+          "sender": "agent-build",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "installation_id": "synthetic-alpha",
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-no-opt-in",
+            "hook_kind": "turn_ended",
+            "event_kind": "turn_ended",
+            "direction": "inbound"
+          }
+        }
+      },
+      "expected": "do not forward message body by default; fail selection"
+    }
+  ],
+  "replay_cases": [
+    {
+      "name": "turn-ended-exact-replay",
+      "expected_selection": true,
+      "receipt_context": {
+        "prior_receipt": {
+          "subscription_identity": "synthetic-inbox-notifications/v1",
+          "iris_message_id": "11111111-1111-5111-8111-111111111111"
+        },
+        "expected_disposition": "deduplicated_no_second_receipt"
+      },
+      "iris_message": {
+        "id": "11111111-1111-5111-8111-111111111111",
+        "thread_id": "22222222-2222-5222-8222-222222222222",
+        "source": "agent_hook",
+        "source_id": "inbox/v1/dHVybi1lbmRlZC1hbHBoYQ",
+        "sender": {
+          "id": "33333333-3333-5333-8333-333333333333",
+          "source": "agent_hook",
+          "provider_instance": "ingest/v1/c3ludGhldGljLWFscGhh",
+          "source_id": "agent-build",
+          "display_name": "Build agent",
+          "avatar_url": null,
+          "metadata": {}
+        },
+        "kind": "text",
+        "body": "Synthetic task turn completed.",
+        "attachments": [],
+        "timestamp": "2026-09-14T12:00:00Z",
+        "is_outbound": false,
+        "metadata": {
+          "schema_version": 1,
+          "installation_id": "synthetic-alpha",
+          "session_id": "session-7",
+          "occurrence_id": "occurrence-001",
+          "hook_kind": "turn_ended",
+          "event_kind": "turn_ended",
+          "direction": "inbound",
+          "content_opt_in": true
+        }
+      },
+      "rite_event": {
+        "source": "iris",
+        "event_type": "text",
+        "action": null,
+        "timestamp": "2026-09-14T12:00:00Z",
+        "severity": "info",
+        "title": "Build agent",
+        "body": "Synthetic task turn completed.",
+        "metadata": {
+          "provider": "agent_hook",
+          "source_id": "inbox/v1/dHVybi1lbmRlZC1hbHBoYQ",
+          "sender": "agent-build",
+          "kind": "text",
+          "iris_metadata": {
+            "schema_version": 1,
+            "installation_id": "synthetic-alpha",
+            "session_id": "session-7",
+            "occurrence_id": "occurrence-001",
+            "hook_kind": "turn_ended",
+            "event_kind": "turn_ended",
+            "direction": "inbound",
+            "content_opt_in": true
+          }
+        }
+      },
+      "expected": "same Iris message ID and no second Rite durable receipt"
+    }
+  ]
+}
