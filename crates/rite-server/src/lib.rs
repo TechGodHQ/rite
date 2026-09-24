@@ -918,6 +918,149 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
+    #[tokio::test]
+    async fn generated_handler_views_preserve_path_equals_configuration() {
+        let config = load_config(
+            r#"[sources.iris]
+ enabled = true
+ base_url = "http://127.0.0.1:1"
+
+ [[rites]]
+ name = "attention"
+ source = "iris"
+ match = { path_equals = { path = ["metadata", "message", "metadata", "event_kind"], value = "attention_required" } }
+ action = { type = "http_post", url = "https://example.test/hook" }"#,
+        )
+        .expect("config parses");
+        let state = configured_state("secret", config).expect("state configures");
+
+        let listed = crate::dispatch::execute_operation(
+            &state,
+            "list_handlers",
+            crate::dispatch::OperationInput::default(),
+        )
+        .await
+        .expect("list_handlers succeeds");
+        assert_eq!(
+            listed[0]["match"]["path_equals"]["path"],
+            serde_json::json!(["metadata", "message", "metadata", "event_kind"])
+        );
+        assert_eq!(
+            listed[0]["match"]["path_equals"]["value"],
+            "attention_required"
+        );
+
+        let get = crate::dispatch::execute_operation(
+            &state,
+            "get_handler",
+            crate::dispatch::OperationInput {
+                path: BTreeMap::from([(String::from("handler_id"), String::from("attention"))]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("get_handler succeeds");
+        assert_eq!(get, listed[0]);
+    }
+
+    #[tokio::test]
+    async fn configured_iris_dispatch_selects_literal_provenance_and_rejects_false_positives() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/inbox-notifications/v1/fixtures.json"
+        ))
+        .expect("fixture JSON parses");
+        let mut messages = Vec::new();
+        let mut expected_records = Vec::new();
+        for section in ["positive_cases", "replay_cases", "negative_cases"] {
+            for case in fixtures[section]
+                .as_array()
+                .expect("fixture section is an array")
+            {
+                let message = case["iris_message"].clone();
+                if case["expected_selection"].as_bool() == Some(true) {
+                    let metadata = &message["metadata"];
+                    expected_records.push(format!(
+                        "{}:{}:{}",
+                        metadata["event_kind"],
+                        metadata["installation_id"],
+                        metadata["occurrence_id"]
+                    ));
+                }
+                messages.push(message);
+            }
+        }
+        assert_eq!(expected_records.len(), 5, "fixture selection baseline");
+
+        let (action_url, mut captured, shutdown) = receiver().await;
+        let iris_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Iris listener binds");
+        let iris_address = iris_listener.local_addr().expect("Iris listener address");
+        tokio::spawn(async move {
+            let (mut socket, _) = iris_listener.accept().await.expect("Iris client connects");
+            let mut response = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            for message in messages {
+                response.push_str("event: message\r\ndata: ");
+                response.push_str(&message.to_string());
+                response.push_str("\r\n\r\n");
+            }
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("fixture events write");
+        });
+
+        let config_text = r#"[sources.iris]
+ enabled = true
+ base_url = "__IRIS_URL__"
+
+ [[rites]]
+ name = "inbox-notification"
+ source = "iris"
+ match = { all_of = [{ path_equals = { path = ["metadata", "message", "source"], value = "agent_hook" } }, { any_of = [{ path_equals = { path = ["metadata", "message", "metadata", "installation_id"], value = "synthetic-alpha" } }, { path_equals = { path = ["metadata", "message", "metadata", "installation_id"], value = "synthetic-beta" } }] }, { path_equals = { path = ["metadata", "message", "metadata", "schema_version"], value = 1 } }, { any_of = [{ path_equals = { path = ["metadata", "message", "metadata", "event_kind"], value = "turn_ended" } }, { path_equals = { path = ["metadata", "message", "metadata", "event_kind"], value = "attention_required" } }, { path_equals = { path = ["metadata", "message", "metadata", "event_kind"], value = "execution_error" } }] }, { path_equals = { path = ["metadata", "message", "metadata", "direction"], value = "inbound" } }, { path_equals = { path = ["metadata", "message", "metadata", "content_opt_in"], value = true } }] }
+ action = { type = "http_post", url = "__ACTION_URL__" }
+ "#
+        .replace("__IRIS_URL__", &format!("http://{iris_address}"))
+        .replace("__ACTION_URL__", &action_url);
+        let config = load_config(&config_text).expect("path predicate config parses");
+        let state = configured_state("secret", config).expect("state configures");
+        start_iris_subscription(&state);
+
+        let mut observed_records = Vec::new();
+        for _ in 0..expected_records.len() {
+            let (_headers, body) = timeout(Duration::from_secs(2), captured.recv())
+                .await
+                .expect("selected event reaches action")
+                .expect("action receiver remains open");
+            let event: serde_json::Value =
+                serde_json::from_str(&body).expect("action receives normalized JSON");
+            let message = &event["metadata"]["message"];
+            observed_records.push(format!(
+                "{}:{}:{}",
+                message["metadata"]["event_kind"],
+                message["metadata"]["installation_id"],
+                message["metadata"]["occurrence_id"]
+            ));
+        }
+        assert_eq!(observed_records, expected_records);
+        assert!(
+            timeout(Duration::from_millis(100), captured.recv())
+                .await
+                .is_err(),
+            "unselected provenance variants must not reach the action"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .events_matched
+                .load(std::sync::atomic::Ordering::Relaxed),
+            expected_records.len() as u64
+        );
+        shutdown.send(()).expect("action receiver shuts down");
+    }
+
     #[test]
     fn example_and_readme_configs_load_and_validate() {
         let readme = include_str!("../../../README.md");
@@ -929,7 +1072,14 @@ mod tests {
             .iter()
             .map(|handler| handler.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(example_names, ["github-pr-opened", "discord-urgent-alert"]);
+        assert_eq!(
+            example_names,
+            [
+                "github-pr-opened",
+                "discord-urgent-alert",
+                "inbox-attention"
+            ]
+        );
         assert!(
             validate(&example_config)
                 .iter()

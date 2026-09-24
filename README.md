@@ -144,7 +144,19 @@ name = "real-prs-only"
 source = "github"
 match = { all_of = [{ event_type = "pull_request" }, { not = { draft = true } }] }
 action = { type = "http_post", url = "https://hooks.example.test/reviews" }
+
+[[rites]]
+name = "inbox-attention"
+source = "iris"
+match = { all_of = [{ path_equals = { path = ["metadata", "message", "source"], value = "agent_hook" } }, { path_equals = { path = ["metadata", "message", "metadata", "schema_version"], value = 1 } }, { path_equals = { path = ["metadata", "message", "metadata", "installation_id"], value = "synthetic-alpha" } }, { path_equals = { path = ["metadata", "message", "metadata", "event_kind"], value = "attention_required" } }, { path_equals = { path = ["metadata", "message", "metadata", "direction"], value = "inbound" } }, { path_equals = { path = ["metadata", "message", "metadata", "content_opt_in"], value = true } }] }
+action = { type = "http_post", url = "https://hooks.example.test/inbox" }
 ```
+
+`path_equals` takes a literal array of object keys rooted at the normalized
+`RiteEvent` JSON shape and a scalar string, integer, or boolean value. It never
+splits keys on dots, traverses arrays, or infers a source/provider. A missing
+path, `null`, or wrong JSON type is a non-match; malformed paths and
+non-scalar expected values are rejected while loading configuration.
 
 `all_of` and `any_of` take nonempty arrays of condition tables; `not` takes
 one condition table. A table mixing operators with other keys — or using two
