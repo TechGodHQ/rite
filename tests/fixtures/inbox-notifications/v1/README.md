@@ -11,9 +11,11 @@ the fixture omits that mechanically duplicated subtree. Tests must parse the
 Iris message through that real adapter, then compare semantic values at the
 literal paths in `docs/design/inbox-notifications.md`.
 
-`expected_selection` is policy guidance for the future selector: it is not a
-claim that the current flat matcher can traverse the paths yet. Negative cases
-must fail selection before any handler action is planned.
+`expected_selection` is policy guidance for the selector. The `path_equals`
+predicate can now express these literal paths without dotted-name inference;
+these fixtures still do not claim durable receipt deduplication, authorization,
+or notification delivery. Negative cases must fail selection before any handler
+action is planned.
 
 `expected_selection` describes only static policy eligibility. An exact replay
 can remain statically eligible while its `receipt_context` separately records

@@ -100,7 +100,8 @@ pub struct RiteHandler {
     pub name: String,
     /// Source ID this handler accepts.
     pub source: String,
-    /// Fields to match against event attributes or metadata.
+    /// Fields to match against event attributes or metadata. The structured
+    /// `path_equals` predicate addresses literal nested object-key paths.
     ///
     /// Malformed compound forms (empty `all_of`/`any_of`, a `not` without
     /// exactly one child, operators mixed with leaves, or sibling
@@ -150,8 +151,8 @@ impl RiteHandler {
         if operators.is_empty() {
             return Ok(MatchCondition::All(
                 map.iter()
-                    .map(|(k, v)| MatchCondition::Leaf(k.clone(), v.clone()))
-                    .collect(),
+                    .map(|(k, v)| Self::leaf_condition(k, v))
+                    .collect::<Result<Vec<_>>>()?,
             ));
         }
         if map.len() != operators.len() {
@@ -179,6 +180,20 @@ impl RiteHandler {
                 ("all_of" | "any_of", MatchValue::Array(_))
                 | ("not", MatchValue::Table(_))
                 | (_, MatchValue::String(_) | MatchValue::Integer(_) | MatchValue::Boolean(_)) => {}
+                ("path_equals", MatchValue::Table(_)) => {
+                    Self::parse_path_equals(value)?;
+                }
+                ("path_equals", _) => {
+                    return Err(RiteError::Config(
+                        "match predicate 'path_equals' requires a table with a literal string-key path and scalar value"
+                            .into(),
+                    ));
+                }
+                (_, MatchValue::StringArray(_)) => {
+                    return Err(RiteError::Config(format!(
+                        "match key '{key}' requires a scalar string, integer, or boolean; string arrays are only valid as the path of 'path_equals'"
+                    )));
+                }
                 ("all_of" | "any_of", MatchValue::Table(_)) => {
                     return Err(RiteError::Config(format!(
                         "match operator '{key}' requires an array of condition tables, not an inline table"
@@ -203,6 +218,80 @@ impl RiteHandler {
             }
         }
         Ok(())
+    }
+
+    fn leaf_condition(key: &str, value: &MatchValue) -> Result<MatchCondition> {
+        if key == "path_equals" && matches!(value, MatchValue::Table(_)) {
+            let (path, expected) = Self::parse_path_equals(value)?;
+            return Ok(MatchCondition::PathEquals { path, expected });
+        }
+        Ok(MatchCondition::Leaf(key.to_owned(), value.clone()))
+    }
+
+    fn parse_path_equals(value: &MatchValue) -> Result<(Vec<String>, MatchValue)> {
+        let MatchValue::Table(fields) = value else {
+            return Err(RiteError::Config(
+                "match predicate 'path_equals' requires a table with a literal string-key path and scalar value"
+                    .into(),
+            ));
+        };
+        if fields.len() != 2 {
+            let unknown = fields
+                .keys()
+                .filter(|key| *key != "path" && *key != "value")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !unknown.is_empty() {
+                return Err(RiteError::Config(format!(
+                    "match predicate 'path_equals' has unsupported field(s): {}",
+                    unknown.join(", ")
+                )));
+            }
+            return Err(RiteError::Config(
+                "match predicate 'path_equals' requires exactly 'path' and 'value' fields".into(),
+            ));
+        }
+        let Some(path) = fields.get("path") else {
+            return Err(RiteError::Config(
+                "match predicate 'path_equals' requires a 'path' field".into(),
+            ));
+        };
+        let path = match path {
+            MatchValue::StringArray(path) => path,
+            MatchValue::Array(children) if children.is_empty() => {
+                return Err(RiteError::Config(
+                    "match predicate 'path_equals.path' must contain at least one key".into(),
+                ));
+            }
+            _ => {
+                return Err(RiteError::Config(
+                    "match predicate 'path_equals.path' must be an array of literal string keys"
+                        .into(),
+                ));
+            }
+        };
+        if path.is_empty() {
+            return Err(RiteError::Config(
+                "match predicate 'path_equals.path' must contain at least one key".into(),
+            ));
+        }
+        if path.iter().any(String::is_empty) {
+            return Err(RiteError::Config(
+                "match predicate 'path_equals.path' cannot contain empty key segments".into(),
+            ));
+        }
+        let Some(expected) = fields.get("value") else {
+            return Err(RiteError::Config(
+                "match predicate 'path_equals' requires a 'value' field".into(),
+            ));
+        };
+        if !expected.is_scalar() {
+            return Err(RiteError::Config(
+                "match predicate 'path_equals.value' must be a scalar string, integer, or boolean"
+                    .into(),
+            ));
+        }
+        Ok((path.clone(), expected.clone()))
     }
 
     fn children_of(
@@ -282,10 +371,11 @@ where
 
 /// A scalar value used to match an event field or metadata item.
 ///
-/// The `Table` and `Array` variants only appear in their declared compound
-/// positions: `Table` for `not`, `Array` for `all_of`/`any_of`. Legacy flat
-/// matchers keep scalar shapes verbatim, and unsupported structured values
-/// are rejected at deserialization time.
+/// The `Table` and `Array` variants only appear in their declared compound or
+/// predicate positions: `Table` for `not`/`path_equals`, `Array` for
+/// `all_of`/`any_of`, and `StringArray` for `path_equals.path`. Legacy flat
+/// matchers keep scalar shapes verbatim, and unsupported structured values are
+/// rejected at deserialization time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MatchValue {
@@ -299,6 +389,8 @@ pub enum MatchValue {
     Table(BTreeMap<String, MatchValue>),
     /// Array of inline tables (children of `all_of`/`any_of`).
     Array(Vec<BTreeMap<String, MatchValue>>),
+    /// Array of literal string keys used by `path_equals.path`.
+    StringArray(Vec<String>),
 }
 
 impl MatchValue {
@@ -307,8 +399,12 @@ impl MatchValue {
             Self::String(expected) => value.as_str() == Some(expected),
             Self::Integer(expected) => value.as_i64() == Some(*expected),
             Self::Boolean(expected) => value.as_bool() == Some(*expected),
-            Self::Table(_) | Self::Array(_) => false,
+            Self::StringArray(_) | Self::Table(_) | Self::Array(_) => false,
         }
+    }
+
+    fn is_scalar(&self) -> bool {
+        matches!(self, Self::String(_) | Self::Integer(_) | Self::Boolean(_))
     }
 
     /// Whether this value has the TOML shape the operator `op` requires.
@@ -331,6 +427,13 @@ pub enum MatchCondition {
     Not(Box<MatchCondition>),
     /// A single field-or-metadata equality/substring leaf.
     Leaf(String, MatchValue),
+    /// Exact equality against a value reached through literal object keys.
+    PathEquals {
+        /// Literal keys traversed from the serialized [`RiteEvent`] root.
+        path: Vec<String>,
+        /// Scalar value that must equal the value at `path`.
+        expected: MatchValue,
+    },
 }
 
 impl MatchCondition {
@@ -342,6 +445,7 @@ impl MatchCondition {
             Self::Any(children) => children.iter().any(|c| c.matches(event)),
             Self::Not(inner) => !inner.matches(event),
             Self::Leaf(field, expected) => leaf_matches(field, expected, event),
+            Self::PathEquals { path, expected } => path_equals_matches(path, expected, event),
         }
     }
 }
@@ -366,6 +470,28 @@ fn leaf_matches(field: &str, expected: &MatchValue, event: &RiteEvent) -> bool {
             .get(key)
             .is_some_and(|value| expected.matches_json(value)),
     }
+}
+
+/// Evaluate a literal-key path predicate against the serialized event root.
+///
+/// A missing path, `null`, an intermediate scalar/array, or a mismatched JSON
+/// type is simply a non-match. Path segments are never split on punctuation,
+/// so keys containing dots and Unicode remain addressable exactly as supplied.
+fn path_equals_matches(path: &[String], expected: &MatchValue, event: &RiteEvent) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let Ok(root) = serde_json::to_value(event) else {
+        return false;
+    };
+    let mut current = &root;
+    for segment in path {
+        let Some(next) = current.get(segment) else {
+            return false;
+        };
+        current = next;
+    }
+    expected.matches_json(current)
 }
 
 impl RiteHandler {
@@ -517,6 +643,160 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
             metadata: BTreeMap::new(),
         };
         assert!(handler.matches(&event));
+    }
+
+    #[test]
+    fn path_equals_matches_literal_nested_paths_and_exact_types() {
+        let handler: RiteHandler = toml::from_str(
+            r#"name = "attention"
+source = "iris"
+match = { all_of = [{ path_equals = { path = ["metadata", "message", "metadata", "event_kind"], value = "attention_required" } }, { path_equals = { path = ["metadata", "message", "metadata", "schema_version"], value = 1 } }, { path_equals = { path = ["metadata", "message", "metadata", "content_opt_in"], value = true } }, { path_equals = { path = ["metadata", "message", "metadata", "literal.key"], value = "π" } }] }
+action = { type = "http_post", url = "https://example.test/hook" }"#,
+        )
+        .expect("path predicate handler parses");
+        let matching = event(
+            "iris",
+            "text",
+            Severity::Info,
+            Some("same body"),
+            BTreeMap::from([(
+                "message".into(),
+                serde_json::json!({
+                    "metadata": {
+                        "event_kind": "attention_required",
+                        "schema_version": 1,
+                        "content_opt_in": true,
+                        "literal.key": "π"
+                    }
+                }),
+            )]),
+        );
+        assert!(handler.matches(&matching));
+
+        let mut wrong_provenance = matching.clone();
+        wrong_provenance
+            .metadata
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .and_then(|message| message.get_mut("metadata"))
+            .and_then(Value::as_object_mut)
+            .expect("metadata object")
+            .insert("event_kind".into(), Value::String("turn_ended".into()));
+        assert!(!handler.matches(&wrong_provenance));
+
+        let mut wrong_type = matching.clone();
+        wrong_type
+            .metadata
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .and_then(|message| message.get_mut("metadata"))
+            .and_then(Value::as_object_mut)
+            .expect("metadata object")
+            .insert("schema_version".into(), Value::String("1".into()));
+        assert!(!handler.matches(&wrong_type));
+
+        let mut missing = matching.clone();
+        missing
+            .metadata
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .and_then(|message| message.get_mut("metadata"))
+            .and_then(Value::as_object_mut)
+            .expect("metadata object")
+            .remove("event_kind");
+        assert!(!handler.matches(&missing));
+
+        let mut null_value = matching.clone();
+        null_value
+            .metadata
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .and_then(|message| message.get_mut("metadata"))
+            .and_then(Value::as_object_mut)
+            .expect("metadata object")
+            .insert("event_kind".into(), Value::Null);
+        assert!(!handler.matches(&null_value));
+
+        let mut wrong_source = matching;
+        wrong_source.source = "github".into();
+        assert!(!handler.matches(&wrong_source));
+    }
+
+    #[test]
+    fn path_equals_declaration_round_trips_through_generated_handler_shape() {
+        let handler: RiteHandler = toml::from_str(
+            r#"name = "attention"
+source = "iris"
+match = { path_equals = { path = ["metadata", "message", "metadata", "event_kind"], value = "attention_required" } }
+action = { type = "http_post", url = "https://example.test/hook" }"#,
+        )
+        .expect("path predicate handler parses");
+        let encoded = serde_json::to_value(&handler).expect("handler serializes");
+        assert_eq!(
+            encoded["match"]["path_equals"]["path"],
+            serde_json::json!(["metadata", "message", "metadata", "event_kind"])
+        );
+        assert_eq!(
+            encoded["match"]["path_equals"]["value"],
+            "attention_required"
+        );
+        let decoded: RiteHandler = serde_json::from_value(encoded).expect("handler round-trips");
+        assert_eq!(decoded, handler);
+    }
+
+    #[test]
+    fn path_equals_rejects_invalid_paths_and_expected_values_at_load() {
+        for (label, matcher, expected_error) in [
+            (
+                "empty path",
+                "match = { path_equals = { path = [], value = \"x\" } }",
+                "at least one key",
+            ),
+            (
+                "empty segment",
+                "match = { path_equals = { path = [\"metadata\", \"\"], value = \"x\" } }",
+                "empty key segments",
+            ),
+            (
+                "missing value",
+                "match = { path_equals = { path = [\"metadata\"] } }",
+                "exactly 'path' and 'value'",
+            ),
+            (
+                "unsupported expected table",
+                "match = { path_equals = { path = [\"metadata\"], value = { nested = true } } }",
+                "scalar string, integer, or boolean",
+            ),
+            (
+                "unsupported extra field",
+                "match = { path_equals = { path = [\"metadata\"], value = \"x\", wildcard = true } }",
+                "unsupported field",
+            ),
+        ] {
+            let text = format!("name = \"{label}\"\nsource = \"iris\"\n{matcher}\n{ACTION}");
+            let error = toml::from_str::<RiteHandler>(&text)
+                .expect_err(&format!("{label} must be rejected at load"));
+            assert!(
+                error.to_string().contains(expected_error),
+                "{label} diagnostic should name the invalid path predicate: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_scalar_path_equals_key_remains_a_metadata_leaf() {
+        let handler: RiteHandler = toml::from_str(&format!(
+            "name = \"legacy-path\"\nsource = \"iris\"\nmatch = {{ path_equals = \"legacy\" }}\n{ACTION}"
+        ))
+        .expect("legacy scalar path_equals parses");
+        let matching = event(
+            "iris",
+            "text",
+            Severity::Info,
+            None,
+            BTreeMap::from([("path_equals".into(), Value::String("legacy".into()))]),
+        );
+        assert!(handler.matches(&matching));
     }
 
     #[test]
