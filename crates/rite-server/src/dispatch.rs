@@ -192,15 +192,16 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
                 url,
                 headers,
                 body_template,
-            } => {
-                let request = crate::http_post_request(
-                    &state.client,
-                    url,
-                    headers,
-                    body_template.as_deref(),
-                    &event,
-                );
-                match request.send().await {
+                body_json,
+            } => match crate::http_post_request(
+                &state.client,
+                url,
+                headers,
+                body_template.as_deref(),
+                body_json.as_ref(),
+                &event,
+            ) {
+                Ok(request) => match request.send().await {
                     Ok(response) if response.status().is_success() => {
                         executed += 1;
                         state
@@ -223,8 +224,15 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(handler = %handler.name, "rite action request failed");
                     }
+                },
+                Err(error) => {
+                    state
+                        .metrics
+                        .actions_failed
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(handler = %handler.name, error = %error, "rite action request could not be built");
                 }
-            }
+            },
         }
     }
     let matched_handlers = matched

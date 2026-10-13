@@ -112,19 +112,47 @@ repository's [`deploy/docker-compose.yml`](https://github.com/TechGodHQ/iris/blo
 `http_post` forwards the normalized event as JSON by default. A handler may
 instead set `body_template` to render a deterministic text body using
 `{{event_type}}`, `{{action}}`, `{{title}}`, `{{body}}`, or nested event
-metadata such as `{{metadata.provider}}`; missing fields render empty.
-Optional `headers` are forwarded verbatim. Templated bodies default to
-`Content-Type: text/plain` unless that header is explicitly set. This remains
-a generic HTTP action: Discord, Slack, and other webhook targets do not add
-provider-specific Rite action types.
+metadata such as `{{metadata.provider}}`; missing fields render empty. Optional
+`headers` are forwarded verbatim. Templated bodies default to
+`Content-Type: text/plain` unless that header is explicitly set.
+
+For a JSON API that needs a custom object, use `body_json` instead of
+`body_template` (the two modes are mutually exclusive). It accepts nested TOML
+tables and arrays, strings, booleans, integers, finite floats, and scalar roots.
+TOML datetimes and non-finite floats are rejected; TOML has no null value, and
+Rite does not invent a null sentinel. Only configured string leaves are
+interpolated. The supported placeholders are the same event fields above;
+malformed or unknown placeholders are rejected while loading configuration.
+Each inserted value is treated as opaque string data and is never rescanned or
+parsed as JSON. A missing or null referenced value fails that action without
+sending it; non-string metadata is represented as JSON text within the string
+leaf. Static object keys, URLs, headers, and credentials remain configuration
+owned.
+
+Structured mode sets `Content-Type: application/json` by default. An explicit
+content type may be `application/json` or `application/json; charset=utf-8`
+(case-insensitive; quoted UTF-8 is also accepted). Other media types, parameters,
+charsets, or duplicate case-insensitive content-type headers are rejected during
+configuration loading. These rules apply only to `body_json`; legacy text and
+no-template request behavior is unchanged.
 
 ```toml
 [[rites]]
 name = "deploy-alert"
 source = "iris"
 match = { body_contains = "URGENT" }
-action = { type = "http_post", url = "https://hooks.example.test/alerts", headers = { "content-type" = "application/json" }, body_template = "{\"content\":\"{{title}}: {{body}}\"}" }
+action = { type = "http_post", url = "https://hooks.example.test/alerts", body_template = "{{title}}: {{body}}" }
+
+[[rites]]
+name = "structured-iris-message"
+source = "iris"
+match = { event_type = "text" }
+action = { type = "http_post", url = "https://api.example.test/messages/synthetic-thread", body_json = { body = "{{body}}", provider = "telegram.synthetic" } }
 ```
+
+The second example keeps the provider instance fixed in configuration while
+preserving arbitrary message text as a JSON string. Rite remains a generic HTTP
+action runner and does not add provider-specific action types.
 
 ## Compound matching
 

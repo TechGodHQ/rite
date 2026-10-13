@@ -12,7 +12,10 @@ use std::{
 };
 
 use axum::{Router, routing::get};
-use rite_core::{EventSource, MATCH_VALIDATION_ERROR_PREFIX, RiteAction, RiteEvent, RiteHandler};
+use rite_core::{
+    ACTION_VALIDATION_ERROR_PREFIX, EventSource, MATCH_VALIDATION_ERROR_PREFIX, RiteAction,
+    RiteEvent, RiteHandler,
+};
 use rite_sources::{github::GitHubSource, iris::IrisSource, uptime_kuma::UptimeKumaSource};
 use serde::Deserialize;
 
@@ -120,8 +123,8 @@ pub fn app(state: AppState) -> Router {
 /// A configuration-load failure safe to display in CLI output and logs.
 ///
 /// Parser errors can retain a copy of their complete source document for span
-/// rendering. This type deliberately retains only a known-safe matcher
-/// diagnostic or a generic parse/type error, never raw TOML values.
+/// rendering. This type deliberately retains only known-safe matcher/action
+/// diagnostics or a generic parse/type error, never raw TOML values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigLoadError(String);
 
@@ -130,6 +133,7 @@ impl ConfigLoadError {
         let message = error.message();
         let safe_message = message
             .strip_prefix(MATCH_VALIDATION_ERROR_PREFIX)
+            .or_else(|| message.strip_prefix(ACTION_VALIDATION_ERROR_PREFIX))
             .map_or_else(
                 || "configuration syntax or value type is invalid".to_owned(),
                 ToOwned::to_owned,
@@ -308,29 +312,46 @@ pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<A
 
 /// Builds the generic HTTP action request shared by webhook and subscription dispatch.
 ///
-/// Template actions default to plain text unless the handler explicitly provides
-/// a content type; legacy actions keep their normalized-event JSON payload.
+/// Structured JSON actions default to `application/json`; template actions
+/// default to plain text unless the handler explicitly provides a content type.
+/// Legacy actions keep their normalized-event JSON payload.
 pub(crate) fn http_post_request(
     client: &reqwest::Client,
     url: &url::Url,
     headers: &BTreeMap<String, String>,
     body_template: Option<&str>,
+    body_json: Option<&serde_json::Value>,
     event: &RiteEvent,
-) -> reqwest::RequestBuilder {
+) -> std::result::Result<reqwest::RequestBuilder, rite_core::JsonTemplateError> {
+    if body_template.is_some() && body_json.is_some() {
+        return Err(rite_core::JsonTemplateError::InvalidConfiguration);
+    }
+
     let mut request = client.post(url.clone());
     for (name, value) in headers {
         request = request.header(name, value);
     }
-    if let Some(template) = body_template {
+    if let Some(body_json) = body_json {
+        let rendered = rite_core::render_json_template(body_json, event)?;
+        let body = serde_json::to_vec(&rendered)
+            .map_err(|_| rite_core::JsonTemplateError::InvalidConfiguration)?;
+        if !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-type"))
+        {
+            request = request.header("content-type", "application/json");
+        }
+        Ok(request.body(body))
+    } else if let Some(template) = body_template {
         if !headers
             .keys()
             .any(|name| name.eq_ignore_ascii_case("content-type"))
         {
             request = request.header("content-type", "text/plain");
         }
-        request.body(rite_core::render_template(template, event))
+        Ok(request.body(rite_core::render_template(template, event)))
     } else {
-        request.json(event)
+        Ok(request.json(event))
     }
 }
 
@@ -361,21 +382,33 @@ pub fn start_iris_subscription(state: &AppState) {
                     url,
                     headers,
                     body_template,
+                    body_json,
                 } = &handler.action;
-                let request =
-                    http_post_request(&client, url, headers, body_template.as_deref(), &event);
-                match request.send().await {
-                    Ok(response) if response.status().is_success() => {
-                        metrics.actions_succeeded.fetch_add(1, Ordering::Relaxed);
-                        tracing::info!(handler = %handler.name, "Iris event action completed");
-                    }
-                    Ok(response) => {
+                match http_post_request(
+                    &client,
+                    url,
+                    headers,
+                    body_template.as_deref(),
+                    body_json.as_ref(),
+                    &event,
+                ) {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.status().is_success() => {
+                            metrics.actions_succeeded.fetch_add(1, Ordering::Relaxed);
+                            tracing::info!(handler = %handler.name, "Iris event action completed");
+                        }
+                        Ok(response) => {
+                            metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(handler = %handler.name, status = %response.status(), "Iris event action returned failure status");
+                        }
+                        Err(_error) => {
+                            metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(handler = %handler.name, "Iris event action request failed");
+                        }
+                    },
+                    Err(error) => {
                         metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(handler = %handler.name, status = %response.status(), "Iris event action returned failure status");
-                    }
-                    Err(_error) => {
-                        metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(handler = %handler.name, "Iris event action request failed");
+                        tracing::warn!(handler = %handler.name, error = %error, "Iris event action request could not be built");
                     }
                 }
             }
@@ -864,28 +897,222 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iris_actions_send_the_same_generic_template_request() {
+    async fn webhook_structured_json_preserves_adversarial_text_and_fails_closed_on_missing_data() {
+        let (action_url, mut captured, shutdown) = receiver().await;
+        let config_text = r#"[sources.uptime_kuma]
+enabled = true
+secret = "kuma-secret"
+
+[[rites]]
+name = "structured-send"
+source = "uptime_kuma"
+match = { event_type = "heartbeat" }
+action = { type = "http_post", url = "__ACTION_URL__", body_json = { body = "{{body}}", nested = { enabled = true, count = 4 }, provider = "telegram.synthetic" } }
+"#
+        .replace("__ACTION_URL__", &action_url);
+        let config = load_config(&config_text).expect("structured action config parses");
+        let state = configured_state("github-secret", config).expect("state configures");
+        let valid_app = app(state.clone());
+        let adversarial = "quotes: \"; slash: \\; newline:\n tab:\t Unicode: 雪; delimiters: {{title}} }}; injection: \"},\"provider\":\"evil\"";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "monitor": { "id": 8, "name": "API" },
+            "heartbeat": { "status": 0, "msg": adversarial }
+        }))
+        .expect("synthetic heartbeat serializes");
+        let response = valid_app
+            .oneshot(
+                Request::post("/event/uptime_kuma")
+                    .header("Signature", kuma_signature("kuma-secret", &body))
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let (headers, captured_body) = timeout(Duration::from_secs(1), captured.recv())
+            .await
+            .expect("structured action arrives")
+            .expect("request captured");
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        let json: serde_json::Value =
+            serde_json::from_str(&captured_body).expect("receiver parses complete JSON");
+        assert_eq!(json["body"], adversarial);
+        assert_eq!(json["provider"], "telegram.synthetic");
+        assert_eq!(
+            json["nested"],
+            serde_json::json!({ "enabled": true, "count": 4 })
+        );
+        assert_eq!(state.metrics.actions_succeeded.load(Ordering::Relaxed), 1);
+
+        let missing_config = load_config(&format!(
+            "[sources.uptime_kuma]\nenabled = true\nsecret = \"kuma-secret\"\n\n[[rites]]\nname = \"missing-body\"\nsource = \"uptime_kuma\"\nmatch = {{ event_type = \"heartbeat\" }}\naction = {{ type = \"http_post\", url = \"{action_url}\", body_json = {{ body = \"{{{{body}}}}\" }} }}"
+        ))
+        .expect("missing-data action config parses");
+        let missing_state = configured_state("github-secret", missing_config)
+            .expect("missing-data state configures");
+        let missing_app = app(missing_state.clone());
+        let no_message = serde_json::to_vec(&serde_json::json!({
+            "monitor": { "id": 9, "name": "API" },
+            "heartbeat": { "status": 0 }
+        }))
+        .expect("synthetic heartbeat serializes");
+        let response = missing_app
+            .oneshot(
+                Request::post("/event/uptime_kuma")
+                    .header("Signature", kuma_signature("kuma-secret", &no_message))
+                    .body(Body::from(no_message))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            missing_state.metrics.actions_failed.load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            timeout(Duration::from_millis(100), captured.recv())
+                .await
+                .is_err()
+        );
+        shutdown.send(()).expect("receiver shuts down");
+    }
+
+    #[tokio::test]
+    async fn generated_handler_views_round_trip_structured_body_json() {
+        let config = load_config(
+            r#"[[rites]]
+name = "structured-view"
+source = "github"
+action = { type = "http_post", url = "https://example.test/hook", body_json = { body = "{{title}}", provider = "telegram.synthetic" } }
+"#,
+        )
+        .expect("structured config parses");
+        let app = app(configured_state("secret", config).expect("state configures"));
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::get("/handlers")
+                    .body(Body::empty())
+                    .expect("list request"),
+            )
+            .await
+            .expect("list response");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .expect("list body");
+        let listed_json: serde_json::Value =
+            serde_json::from_slice(&listed_body).expect("list response is JSON");
+        let expected = serde_json::json!({ "body": "{{title}}", "provider": "telegram.synthetic" });
+        assert_eq!(listed_json[0]["action"]["body_json"], expected);
+
+        let fetched = app
+            .oneshot(
+                Request::get("/handlers/structured-view")
+                    .body(Body::empty())
+                    .expect("get request"),
+            )
+            .await
+            .expect("get response");
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let fetched_body = to_bytes(fetched.into_body(), usize::MAX)
+            .await
+            .expect("get body");
+        let fetched_json: serde_json::Value =
+            serde_json::from_slice(&fetched_body).expect("get response is JSON");
+        assert_eq!(fetched_json["action"]["body_json"], expected);
+    }
+
+    #[test]
+    fn structured_config_errors_are_value_free_at_the_production_load_boundary() {
+        let config = r#"[[rites]]
+name = "structured"
+source = "github"
+action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CONFIG_TOKEN", body_json = { private = "PRIVATE_BODY_SENTINEL", timestamp = 2026-10-13 } }
+"#;
+        let error = load_config(config).expect_err("TOML datetimes are not JSON values");
+        let displayed = error.to_string();
+        assert!(displayed.contains("TOML datetime"));
+        assert!(!displayed.contains("PRIVATE_CONFIG_TOKEN"));
+        assert!(!displayed.contains("PRIVATE_BODY_SENTINEL"));
+    }
+
+    #[test]
+    fn structured_policy_violations_fail_during_production_config_loading() {
+        let invalid_action_fields = [
+            r#"body_template = "legacy", body_json = { body = "fixed" }"#,
+            r#"body_json = { body = "{{unknown_PRIVATE_BODY_SENTINEL}}" }"#,
+            r#"body_json = { body = "unclosed {{body" }"#,
+            r#"headers = { "Content-Type" = "text/plain" }, body_json = { body = "fixed" }"#,
+            r#"headers = { "Content-Type" = "application/json; charset=latin1" }, body_json = { body = "fixed" }"#,
+            r#"headers = { "Content-Type" = "application/json", "content-type" = "application/json" }, body_json = { body = "fixed" }"#,
+            r#"body_json = { private = "PRIVATE_BODY_SENTINEL", timestamp = 2026-10-13 }"#,
+            "body_json = nan",
+        ];
+        let template = r#"[[rites]]
+name = "invalid-structured"
+source = "github"
+action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CONFIG_TOKEN", __ACTION_FIELDS__ }
+"#;
+
+        for fields in invalid_action_fields {
+            let config = template.replace("__ACTION_FIELDS__", fields);
+            let error = load_config(&config)
+                .expect_err("invalid structured action config must fail during loading");
+            let displayed = error.to_string();
+            assert!(!displayed.contains("PRIVATE_CONFIG_TOKEN"));
+            assert!(!displayed.contains("PRIVATE_BODY_SENTINEL"));
+        }
+    }
+
+    #[tokio::test]
+    async fn iris_structured_json_uses_the_shared_request_builder() {
         let (action_url, mut captured, shutdown) = receiver().await;
         let iris_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Iris listener binds");
         let iris_address = iris_listener.local_addr().expect("Iris listener address");
+        let adversarial = "quotes: \"; slash: \\; newline:\n tab:\t Unicode: 雪; delimiters: {{title}} }}; injection: \"},\"provider\":\"evil\"";
+        let message = serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "thread_id": "00000000-0000-0000-0000-000000000002",
+            "source": "telegram",
+            "source_id": "42",
+            "sender": { "source_id": "shiv", "display_name": "Shiv" },
+            "kind": "text",
+            "body": adversarial,
+            "timestamp": "2026-08-15T00:00:00Z",
+            "metadata": {}
+        })
+        .to_string();
+        let (iris_shutdown, wait_for_shutdown) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut socket, _) = iris_listener.accept().await.expect("Iris client connects");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\nevent: message\r\ndata: {message}\r\n\r\n"
+            );
             socket
-                .write_all(concat!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-                    "event: message\r\n",
-                    "data: {\"id\":\"00000000-0000-0000-0000-000000000001\",\"thread_id\":\"00000000-0000-0000-0000-000000000002\",\"source\":\"telegram\",\"source_id\":\"42\",\"sender\":{\"source_id\":\"shiv\",\"display_name\":\"Shiv\"},\"kind\":\"text\",\"body\":\"hello\",\"timestamp\":\"2026-08-15T00:00:00Z\",\"metadata\":{}}\r\n\r\n"
-                ).as_bytes())
+                .write_all(response.as_bytes())
                 .await
                 .expect("Iris event writes");
+            let _ = wait_for_shutdown.await;
         });
-        let config = load_config(&format!(
-            "[sources.iris]\nenabled = true\nbase_url = \"http://{iris_address}\"\n\n[[rites]]\nname = \"iris-template\"\nsource = \"iris\"\nmatch = {{ event_type = \"text\" }}\naction = {{ type = \"http_post\", url = \"{action_url}\", headers = {{ x_action = \"iris\" }}, body_template = \"{{{{source}}}}:{{{{body}}}}\" }}"
-        ))
-        .expect("config parses");
-        let state = configured_state("secret", config).expect("state configures");
+        let config_text = r#"[sources.iris]
+        enabled = true
+        base_url = "__IRIS_URL__"
+
+        [[rites]]
+        name = "iris-structured"
+        source = "iris"
+        match = { event_type = "text" }
+        action = { type = "http_post", url = "__ACTION_URL__", headers = { x_action = "iris" }, body_json = { body = "{{body}}", provider = "telegram.synthetic" } }
+        "#
+        .replace("__IRIS_URL__", &format!("http://{iris_address}"))
+        .replace("__ACTION_URL__", &action_url);
+        let config = load_config(&config_text).expect("config parses");
+        let state = configured_state("fixture-secret", config).expect("state configures");
         start_iris_subscription(&state);
 
         let (headers, body) = timeout(Duration::from_secs(1), captured.recv())
@@ -893,8 +1120,18 @@ mod tests {
             .expect("Iris action arrives")
             .expect("Iris request captured");
         assert_eq!(headers["x_action"], "iris");
-        assert_eq!(headers[header::CONTENT_TYPE], "text/plain");
-        assert_eq!(body, "iris:hello");
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("complete body is JSON");
+        assert_eq!(json["body"], adversarial);
+        assert_eq!(json["provider"], "telegram.synthetic");
+        timeout(Duration::from_secs(1), async {
+            while state.metrics.actions_succeeded.load(Ordering::Relaxed) != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("successful HTTP response updates the action metric");
+        iris_shutdown.send(()).expect("Iris stream shuts down");
         shutdown.send(()).expect("receiver shuts down");
     }
 
