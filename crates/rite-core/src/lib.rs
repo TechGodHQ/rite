@@ -16,6 +16,10 @@ pub type Result<T> = std::result::Result<T, RiteError>;
 /// boundary without rendering the originating TOML source text.
 pub const MATCH_VALIDATION_ERROR_PREFIX: &str = "rite matcher validation: ";
 
+/// Stable marker for action errors that may safely cross the config-load
+/// boundary without rendering the originating TOML values.
+pub const ACTION_VALIDATION_ERROR_PREFIX: &str = "rite action validation: ";
+
 /// Errors returned by Rite components.
 #[derive(Debug, Error)]
 pub enum RiteError {
@@ -115,6 +119,7 @@ pub struct RiteHandler {
     )]
     pub matcher: BTreeMap<String, MatchValue>,
     /// Action performed after a match.
+    #[serde(deserialize_with = "deserialize_validated_action")]
     pub action: RiteAction,
 }
 
@@ -369,6 +374,51 @@ where
         })
 }
 
+fn deserialize_validated_action<'de, D>(
+    deserializer: D,
+) -> std::result::Result<RiteAction, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let action = RiteAction::deserialize(deserializer)?;
+    validate_action(&action).map_err(|error| {
+        serde::de::Error::custom(format!("{ACTION_VALIDATION_ERROR_PREFIX}{error}"))
+    })?;
+    Ok(action)
+}
+
+fn deserialize_json_body<'de, D>(deserializer: D) -> std::result::Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    toml_value_to_json(&value).map(Some).map_err(|error| {
+        serde::de::Error::custom(format!("{ACTION_VALIDATION_ERROR_PREFIX}{error}"))
+    })
+}
+
+fn toml_value_to_json(value: &toml::Value) -> std::result::Result<Value, &'static str> {
+    match value {
+        toml::Value::String(value) => Ok(Value::String(value.clone())),
+        toml::Value::Integer(value) => Ok(Value::from(*value)),
+        toml::Value::Float(value) => serde_json::Number::from_f64(*value)
+            .map(Value::Number)
+            .ok_or("structured JSON body cannot contain a non-finite float"),
+        toml::Value::Boolean(value) => Ok(Value::Bool(*value)),
+        toml::Value::Datetime(_) => Err("structured JSON body cannot contain a TOML datetime"),
+        toml::Value::Array(values) => values
+            .iter()
+            .map(toml_value_to_json)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(Value::Array),
+        toml::Value::Table(values) => values
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), toml_value_to_json(value)?)))
+            .collect::<std::result::Result<serde_json::Map<_, _>, &'static str>>()
+            .map(Value::Object),
+    }
+}
+
 /// A scalar value used to match an event field or metadata item.
 ///
 /// The `Table` and `Array` variants only appear in their declared compound or
@@ -515,7 +565,7 @@ impl RiteHandler {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RiteAction {
-    /// Forward the normalized event as JSON, or a configured template, to an HTTP endpoint.
+    /// Forward an event or configured body to a generic HTTP endpoint.
     HttpPost {
         /// Destination URL.
         url: Url,
@@ -525,7 +575,228 @@ pub enum RiteAction {
         /// Optional `{{field}}` template for the request body.
         #[serde(default)]
         body_template: Option<String>,
+        /// Optional structured JSON body. Only string leaves are templated.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_json_body"
+        )]
+        body_json: Option<Value>,
     },
+}
+
+/// A safe, code-authored failure while validating or rendering a structured body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum JsonTemplateError {
+    /// The configured placeholder syntax or field name is invalid.
+    #[error("structured JSON template is invalid")]
+    InvalidTemplate,
+    /// The configured HTTP body modes conflict or cannot be serialized.
+    #[error("structured JSON action configuration is invalid")]
+    InvalidConfiguration,
+    /// A referenced event field is missing or null.
+    #[error("structured JSON template references missing or null data")]
+    MissingData,
+}
+
+fn validate_action(action: &RiteAction) -> std::result::Result<(), String> {
+    match action {
+        RiteAction::HttpPost {
+            headers,
+            body_template,
+            body_json,
+            ..
+        } => {
+            if body_template.is_some() && body_json.is_some() {
+                return Err("body_json and body_template are mutually exclusive".into());
+            }
+            if let Some(body) = body_json {
+                validate_json_template(body).map_err(|error| error.to_string())?;
+                validate_json_content_type(headers)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_json_content_type(
+    headers: &BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    let mut values = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    let Some(value) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        return Err("structured JSON permits only one content-type header".into());
+    }
+
+    let mut parts = value.split(';');
+    let media_type = parts.next().unwrap_or_default().trim();
+    if !media_type.eq_ignore_ascii_case("application/json") {
+        return Err("structured JSON content-type must be application/json".into());
+    }
+    let Some(parameter) = parts.next() else {
+        return Ok(());
+    };
+    if parts.next().is_some() {
+        return Err("structured JSON content-type permits only charset=utf-8".into());
+    }
+    let Some((name, raw_value)) = parameter.split_once('=') else {
+        return Err("structured JSON content-type permits only charset=utf-8".into());
+    };
+    let raw_value = raw_value.trim();
+    let charset = if raw_value.starts_with('"') && raw_value.ends_with('"') && raw_value.len() >= 2
+    {
+        &raw_value[1..raw_value.len() - 1]
+    } else if raw_value.starts_with('"') || raw_value.ends_with('"') {
+        return Err("structured JSON content-type permits only charset=utf-8".into());
+    } else {
+        raw_value
+    };
+    if !name.trim().eq_ignore_ascii_case("charset") || !charset.eq_ignore_ascii_case("utf-8") {
+        return Err("structured JSON content-type permits only charset=utf-8".into());
+    }
+    Ok(())
+}
+
+/// Validate the structured body's string-leaf templates before serving.
+pub fn validate_json_template(value: &Value) -> std::result::Result<(), JsonTemplateError> {
+    match value {
+        Value::String(template) => {
+            template_fields(template)?;
+            Ok(())
+        }
+        Value::Array(values) => values.iter().try_for_each(validate_json_template),
+        Value::Object(values) => values.values().try_for_each(validate_json_template),
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+    }
+}
+
+fn template_fields(
+    template: &str,
+) -> std::result::Result<Vec<(std::ops::Range<usize>, &str)>, JsonTemplateError> {
+    let mut fields = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let opening = template[cursor..].find("{{").map(|offset| cursor + offset);
+        let closing = template[cursor..].find("}}").map(|offset| cursor + offset);
+        match (opening, closing) {
+            (None, None) => return Ok(fields),
+            (None, Some(_)) => return Err(JsonTemplateError::InvalidTemplate),
+            (Some(open), Some(close)) if close < open => {
+                return Err(JsonTemplateError::InvalidTemplate);
+            }
+            (Some(open), _) => {
+                let field_start = open + 2;
+                let field_end = template[field_start..]
+                    .find("}}")
+                    .map(|offset| field_start + offset)
+                    .ok_or(JsonTemplateError::InvalidTemplate)?;
+                let field = &template[field_start..field_end];
+                if field.contains("{{") || !is_supported_template_field(field) {
+                    return Err(JsonTemplateError::InvalidTemplate);
+                }
+                let end = field_end + 2;
+                fields.push((open..end, field));
+                cursor = end;
+            }
+        }
+    }
+}
+
+fn is_supported_template_field(field: &str) -> bool {
+    match field {
+        "source" | "event_type" | "action" | "timestamp" | "severity" | "title" | "body" => true,
+        _ => field.strip_prefix("metadata.").is_some_and(|path| {
+            let segments = path.split('.').collect::<Vec<_>>();
+            !segments.is_empty() && segments.iter().all(|segment| !segment.is_empty())
+        }),
+    }
+}
+
+/// Render a structured HTTP body, substituting only configured string leaves.
+///
+/// Inserted values are appended once and are never interpreted as templates or
+/// JSON syntax. The caller serializes the returned value after rendering.
+pub fn render_json_template(
+    value: &Value,
+    event: &RiteEvent,
+) -> std::result::Result<Value, JsonTemplateError> {
+    match value {
+        Value::String(template) => Ok(Value::String(render_json_template_string(template, event)?)),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| render_json_template(value, event))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), render_json_template(value, event)?)))
+            .collect::<std::result::Result<serde_json::Map<_, _>, JsonTemplateError>>()
+            .map(Value::Object),
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(value.clone()),
+    }
+}
+
+fn render_json_template_string(
+    template: &str,
+    event: &RiteEvent,
+) -> std::result::Result<String, JsonTemplateError> {
+    let fields = template_fields(template)?;
+    let mut rendered = String::with_capacity(template.len());
+    let mut cursor = 0;
+    for (range, field) in fields {
+        rendered.push_str(&template[cursor..range.start]);
+        rendered.push_str(&structured_template_value(field, event)?);
+        cursor = range.end;
+    }
+    rendered.push_str(&template[cursor..]);
+    Ok(rendered)
+}
+
+fn structured_template_value(
+    field: &str,
+    event: &RiteEvent,
+) -> std::result::Result<String, JsonTemplateError> {
+    let text = match field {
+        "source" => event.source.clone(),
+        "event_type" => event.event_type.clone(),
+        "action" => event.action.clone().ok_or(JsonTemplateError::MissingData)?,
+        "timestamp" => event.timestamp.to_rfc3339(),
+        "severity" => match event.severity {
+            Severity::Info => "info",
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+            Severity::Critical => "critical",
+        }
+        .to_owned(),
+        "title" => event.title.clone(),
+        "body" => event.body.clone().ok_or(JsonTemplateError::MissingData)?,
+        _ => {
+            let path = field
+                .strip_prefix("metadata.")
+                .ok_or(JsonTemplateError::InvalidTemplate)?;
+            let mut segments = path.split('.');
+            let mut value = event
+                .metadata
+                .get(segments.next().ok_or(JsonTemplateError::InvalidTemplate)?)
+                .ok_or(JsonTemplateError::MissingData)?;
+            for segment in segments {
+                value = value.get(segment).ok_or(JsonTemplateError::MissingData)?;
+            }
+            if value.is_null() {
+                return Err(JsonTemplateError::MissingData);
+            }
+            match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            }
+        }
+    };
+    Ok(text)
 }
 
 /// Render a deterministic HTTP action template against a normalized event.
@@ -840,6 +1111,133 @@ action = { type = "http_post", url = "https://example.test/hook" }"#,
                 body_template: None,
                 ..
             } if headers.is_empty()
+        ));
+    }
+
+    #[test]
+    fn structured_json_toml_values_render_as_opaque_string_data() {
+        let adversarial = "quotes: \" \"; slash: \\; newline:\n tab:\t Unicode: 雪; delimiters: {{title}} }}; injection: \"},\"provider\":\"evil\"";
+        let handler: RiteHandler = toml::from_str(
+            r#"name = "structured"
+source = "iris"
+action = { type = "http_post", url = "https://example.test/hook", body_json = { "{{body}}" = "literal key", content = "{{body}}", nested = { count = "{{metadata.nested.count}}", label = "{{metadata.nested.label}}" }, provider = "telegram.synthetic", values = [true, 7, 1.5, "static 雪"] } }"#,
+        )
+        .expect("structured TOML parses");
+        let RiteAction::HttpPost {
+            body_json: Some(body_json),
+            ..
+        } = handler.action
+        else {
+            panic!("structured body is configured");
+        };
+        let event = event(
+            "iris",
+            "text",
+            Severity::Info,
+            Some(adversarial),
+            BTreeMap::from([(
+                "nested".into(),
+                serde_json::json!({ "count": 42, "label": "雪" }),
+            )]),
+        );
+
+        let rendered = render_json_template(&body_json, &event).expect("template renders");
+        assert_eq!(rendered["{{body}}"], "literal key");
+        assert_eq!(rendered["content"], adversarial);
+        assert_eq!(rendered["nested"]["count"], "42");
+        assert_eq!(rendered["nested"]["label"], "雪");
+        assert_eq!(rendered["provider"], "telegram.synthetic");
+        assert_eq!(
+            rendered["values"],
+            serde_json::json!([true, 7, 1.5, "static 雪"])
+        );
+        let encoded = serde_json::to_vec(&rendered).expect("complete body serializes as JSON");
+        let decoded: Value = serde_json::from_slice(&encoded).expect("serialized body parses");
+        assert_eq!(decoded, rendered);
+    }
+
+    #[test]
+    fn structured_json_missing_or_null_fields_fail_but_present_empty_strings_do_not() {
+        let body_template = serde_json::json!("{{body}}");
+        let missing_body = event("iris", "text", Severity::Info, None, BTreeMap::new());
+        assert_eq!(
+            render_json_template(&body_template, &missing_body),
+            Err(JsonTemplateError::MissingData)
+        );
+
+        let metadata_template = serde_json::json!("{{metadata.optional}} ");
+        let null_metadata = event(
+            "iris",
+            "text",
+            Severity::Info,
+            Some("present"),
+            BTreeMap::from([("optional".into(), Value::Null)]),
+        );
+        assert_eq!(
+            render_json_template(&metadata_template, &null_metadata),
+            Err(JsonTemplateError::MissingData)
+        );
+
+        let mut empty_action = event("iris", "text", Severity::Info, None, BTreeMap::new());
+        empty_action.action = Some(String::new());
+        assert_eq!(
+            render_json_template(&serde_json::json!("{{action}}"), &empty_action)
+                .expect("empty but present values are valid"),
+            serde_json::json!("")
+        );
+    }
+
+    #[test]
+    fn structured_json_toml_rejects_datetime_and_non_finite_numbers() {
+        for (value, expected) in [
+            ("2026-10-13", "TOML datetime"),
+            ("nan", "non-finite float"),
+            ("inf", "non-finite float"),
+        ] {
+            let config = format!(
+                "name = \"structured\"\nsource = \"github\"\naction = {{ type = \"http_post\", url = \"https://example.test/hook\", body_json = {{ value = {value} }} }}"
+            );
+            let error = toml::from_str::<RiteHandler>(&config)
+                .expect_err("non-JSON TOML values must be rejected");
+            assert!(error.message().contains(expected), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn structured_json_validation_rejects_invalid_modes_templates_and_content_types() {
+        let invalid = [
+            "body_template = \"legacy\", body_json = { text = \"fixed\" }",
+            "body_json = { text = \"{{unknown}}\" }",
+            "body_json = { text = \"{{metadata..value}}\" }",
+            "body_json = { text = \"unclosed {{body\" }",
+            "body_json = { text = \"orphan }}\" }",
+            "headers = { \"Content-Type\" = \"text/plain\" }, body_json = { text = \"fixed\" }",
+            "headers = { \"Content-Type\" = \"application/json; charset=latin1\" }, body_json = { text = \"fixed\" }",
+            "headers = { \"Content-Type\" = \"application/json; charset=utf-8; version=1\" }, body_json = { text = \"fixed\" }",
+            "headers = { \"Content-Type\" = \"application/json\", \"content-type\" = \"application/json\" }, body_json = { text = \"fixed\" }",
+        ];
+        for fields in invalid {
+            let config = format!(
+                "name = \"structured\"\nsource = \"github\"\naction = {{ type = \"http_post\", url = \"https://example.test/hook\", {fields} }}"
+            );
+            assert!(
+                toml::from_str::<RiteHandler>(&config).is_err(),
+                "invalid configuration accepted: {fields}"
+            );
+        }
+
+        let valid: RiteHandler = toml::from_str(
+            r#"name = "structured"
+source = "github"
+action = { type = "http_post", url = "https://example.test/hook", headers = { "Content-Type" = "Application/JSON; charset=\"UTF-8\"" }, body_json = "scalar root" }"#,
+        )
+        .expect("JSON UTF-8 content type and scalar roots are supported");
+        assert!(matches!(
+            valid.action,
+            RiteAction::HttpPost {
+                body_json: Some(Value::String(ref value)),
+                ..
+            } if value == "scalar root"
         ));
     }
 

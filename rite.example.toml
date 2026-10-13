@@ -24,4 +24,4 @@ action = { type = "http_post", url = "https://example.test/hooks/urgent", header
 name = "inbox-attention"
 source = "iris"
 match = { all_of = [{ path_equals = { path = ["metadata", "message", "source"], value = "agent_hook" } }, { path_equals = { path = ["metadata", "message", "metadata", "schema_version"], value = 1 } }, { path_equals = { path = ["metadata", "message", "metadata", "installation_id"], value = "synthetic-alpha" } }, { path_equals = { path = ["metadata", "message", "metadata", "event_kind"], value = "attention_required" } }, { path_equals = { path = ["metadata", "message", "metadata", "direction"], value = "inbound" } }, { path_equals = { path = ["metadata", "message", "metadata", "content_opt_in"], value = true } }] }
-action = { type = "http_post", url = "https://example.test/hooks/inbox" }
+action = { type = "http_post", url = "https://example.test/hooks/inbox", body_json = { body = "{{metadata.message.body}}", provider = "telegram.synthetic" } }
