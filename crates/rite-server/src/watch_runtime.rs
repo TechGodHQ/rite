@@ -139,42 +139,33 @@ impl WatchService {
             Some(file) => file,
             None => WatchFile::empty(host_utc_ms).map_err(|_| RuntimeError::Transition)?,
         };
-        if !file.watches.is_empty() {
-            recover(
-                &file,
-                RecoveryClock {
-                    host_utc_ms: Some(host_utc_ms),
-                    monotonic_anchor_ms: Some(monotonic_anchor_ms),
-                    // SystemTime is the declared environmental host-time
-                    // assumption; hidden cross-boot manipulation is not detectable here.
-                    host_time_trusted: true,
-                },
-            )
-            .map_err(|error| match error {
+        let recovery_clock = RecoveryClock {
+            host_utc_ms: Some(host_utc_ms),
+            monotonic_anchor_ms: Some(monotonic_anchor_ms),
+            // SystemTime is the declared environmental host-time
+            // assumption; hidden cross-boot manipulation is not detectable here.
+            host_time_trusted: true,
+        };
+        let recovered_before_reconcile =
+            recover(&file, recovery_clock).map_err(|error| match error {
                 WatchError::HostTimeUnavailable => RuntimeError::RecoveryTimeUnavailable,
                 WatchError::InvalidRecord => RuntimeError::InvalidState,
                 _ => RuntimeError::Transition,
             })?;
-        }
+        apply_recovered_records(&mut file, &recovered_before_reconcile)?;
+        // Advance only the validated in-memory snapshot before add/remove
+        // reconciliation stamps records with the sampled recovery instant.
+        file.advance_time(host_utc_ms)
+            .map_err(|_| RuntimeError::RecoveryTimeUnavailable)?;
         reconcile_watch_config(&mut file, &configs, host_utc_ms)?;
         // Record validity is checked independently from host-clock comparability.
         file.validate().map_err(|_| RuntimeError::InvalidState)?;
-        let recovered = recover(
-            &file,
-            RecoveryClock {
-                host_utc_ms: Some(host_utc_ms),
-                monotonic_anchor_ms: Some(monotonic_anchor_ms),
-                host_time_trusted: true,
-            },
-        )
-        .map_err(|error| match error {
+        let recovered = recover(&file, recovery_clock).map_err(|error| match error {
             WatchError::HostTimeUnavailable => RuntimeError::RecoveryTimeUnavailable,
             WatchError::InvalidRecord => RuntimeError::InvalidState,
             _ => RuntimeError::Transition,
         })?;
         apply_recovered_records(&mut file, &recovered)?;
-        file.advance_time(host_utc_ms)
-            .map_err(|_| RuntimeError::RecoveryTimeUnavailable)?;
         file.validate().map_err(|_| RuntimeError::InvalidState)?;
         let mut store = DurableStore {
             path: path.to_owned(),
@@ -687,6 +678,50 @@ mod tests {
             "a late subscriber must observe an earlier fatal signal"
         );
         drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reconciliation_can_add_a_watch_after_durable_time_advances() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let original = watch("http://127.0.0.1:9/action");
+        drop(WatchService::open_at(&path, std::slice::from_ref(&original), 0, 0).unwrap());
+
+        let mut added = watch("http://127.0.0.1:9/action");
+        added.name = "watch-b".into();
+        let service = WatchService::open_at(&path, &[original, added], 100, 100).unwrap();
+        let state = service.snapshot().unwrap();
+        assert_eq!(state.high_water_utc_ms, 100);
+        assert_eq!(state.watches["watch-b"].arm_started_utc_ms, 100);
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reconciliation_can_remove_pending_watch_after_durable_time_advances() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let original = watch("http://127.0.0.1:9/action");
+        let mut retained = watch("http://127.0.0.1:9/action");
+        retained.name = "watch-b".into();
+        retained.window_secs = 600;
+        let service = WatchService::open_at(&path, &[original, retained.clone()], 0, 0).unwrap();
+        assert_eq!(
+            service.step_at(60_000).unwrap().unwrap().watch_name,
+            "watch-a"
+        );
+        drop(service);
+
+        let reopened = WatchService::open_at(&path, &[retained], 61_000, 100).unwrap();
+        let state = reopened.snapshot().unwrap();
+        assert_eq!(state.high_water_utc_ms, 61_000);
+        assert!(state.watches["watch-a"].pending.is_none());
+        let outcome = state.watches["watch-a"].last_outcome.as_ref().unwrap();
+        assert_eq!(outcome.finished_at_utc_ms, 61_000);
+        assert_eq!(outcome.result, TerminalResult::Removed);
+        assert!(state.watches["watch-b"].pending.is_none());
+        drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }
 
