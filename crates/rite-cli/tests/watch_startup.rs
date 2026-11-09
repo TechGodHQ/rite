@@ -91,6 +91,97 @@ fn serving_a_new_watch_commits_its_initial_arm_before_accepting_traffic() {
 }
 
 #[test]
+fn a_second_serving_process_cannot_acquire_the_live_watch_state_lock() {
+    let directory = temp_dir();
+    let state_path = directory.join("watch-state.json");
+    let config_path = directory.join("rite.toml");
+    let config = format!(
+        "[watch_state]\npath = \"{}\"\n\n[[watches]]\nname = \"lock-owner\"\nwatch_source = [\"github\"]\nmatch = {{ event_type = \"push\" }}\nwindow_secs = 60\naction = {{ type = \"http_post\", url = \"http://127.0.0.1:9/watch\" }}\n",
+        state_path.display()
+    );
+    fs::write(&config_path, config).expect("write shared synthetic config");
+    let first_probe = TcpListener::bind("127.0.0.1:0").expect("reserve first listener");
+    let first_address = first_probe.local_addr().unwrap();
+    let second_probe = TcpListener::bind("127.0.0.1:0").expect("reserve second listener");
+    let second_address = second_probe.local_addr().unwrap();
+    drop(first_probe);
+    drop(second_probe);
+
+    let mut first = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_rite"))
+            .args([
+                "--config",
+                config_path.to_str().unwrap(),
+                "--listen",
+                &first_address.to_string(),
+            ])
+            .env("RITE_GITHUB_WEBHOOK_SECRET", "synthetic-test-secret")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start first isolated Rite process"),
+    );
+    let ready_deadline = Instant::now() + PROCESS_TIMEOUT;
+    let mut first_ready = false;
+    while Instant::now() < ready_deadline {
+        if let Some(status) = first.0.try_wait().unwrap() {
+            panic!("first Rite process exited unexpectedly: {status}");
+        }
+        if exchange(
+            first_address,
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .is_ok_and(|response| response.contains("200 OK"))
+        {
+            first_ready = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(first_ready, "first process owns and serves the watch state");
+
+    let second = Command::new(env!("CARGO_BIN_EXE_rite"))
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--listen",
+            &second_address.to_string(),
+        ])
+        .env("RITE_GITHUB_WEBHOOK_SECRET", "synthetic-test-secret")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start second isolated Rite process");
+    let mut second = ChildGuard(second);
+    let failure_deadline = Instant::now() + PROCESS_TIMEOUT;
+    let mut second_status = None;
+    while Instant::now() < failure_deadline {
+        if let Some(status) = second.0.try_wait().unwrap() {
+            second_status = Some(status);
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let status = second_status.expect("second process must fail on the live file lock");
+    assert!(
+        !status.success(),
+        "lock contention exits nonzero before bind"
+    );
+    assert!(TcpStream::connect_timeout(&second_address, Duration::from_millis(100)).is_err());
+    assert!(
+        exchange(
+            first_address,
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .is_ok_and(|response| response.contains("200 OK"))
+    );
+
+    drop(second);
+    drop(first);
+    fs::remove_dir_all(directory).expect("remove shared synthetic fixture");
+}
+
+#[test]
 fn invalid_durable_record_exits_before_the_cli_binds_and_preserves_saved_bytes() {
     let directory = temp_dir();
     let state_path = directory.join("watch-state.json");

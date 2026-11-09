@@ -635,7 +635,8 @@ pub enum JsonTemplateError {
     MissingData,
 }
 
-fn validate_action(action: &RiteAction) -> std::result::Result<(), String> {
+/// Validate a programmatically constructed action before it is executed.
+pub fn validate_action(action: &RiteAction) -> std::result::Result<(), String> {
     match action {
         RiteAction::HttpPost {
             headers,

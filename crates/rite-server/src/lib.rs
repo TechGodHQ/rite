@@ -297,33 +297,7 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
         });
     }
 
-    let mut names = std::collections::BTreeSet::new();
-    for handler in &config.rites {
-        if let Err(error) = handler.condition_tree() {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: format!(
-                    "handler '{}' has an invalid match table: {error}",
-                    handler.name
-                ),
-            });
-        }
-        if !configured_sources.contains(handler.source.as_str()) {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: format!(
-                    "handler '{}' references unknown source '{}'",
-                    handler.name, handler.source
-                ),
-            });
-        }
-        if !names.insert(handler.name.as_str()) {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: format!("duplicate handler name '{}'", handler.name),
-            });
-        }
-    }
+    diagnostics.extend(validate_handler_config(config, &configured_sources));
 
     let enabled_sources = [
         Some("github"),
@@ -344,6 +318,47 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
     .flatten()
     .collect::<std::collections::BTreeSet<_>>();
     diagnostics.extend(validate_watch_config(config, &enabled_sources));
+    diagnostics
+}
+
+fn validate_handler_config(
+    config: &RiteConfig,
+    configured_sources: &std::collections::BTreeSet<&str>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    for handler in &config.rites {
+        if let Err(error) = handler.condition_tree() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!(
+                    "handler '{}' has an invalid match table: {error}",
+                    handler.name
+                ),
+            });
+        }
+        if rite_core::validate_action(&handler.action).is_err() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("handler '{}' has an invalid action", handler.name),
+            });
+        }
+        if !configured_sources.contains(handler.source.as_str()) {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!(
+                    "handler '{}' references unknown source '{}'",
+                    handler.name, handler.source
+                ),
+            });
+        }
+        if !names.insert(handler.name.as_str()) {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("duplicate handler name '{}'", handler.name),
+            });
+        }
+    }
     diagnostics
 }
 
@@ -370,6 +385,12 @@ fn validate_watch_config(
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Error,
                 message: format!("watch '{}' matcher is malformed", watch.name),
+            });
+        }
+        if rite_core::validate_action(&watch.action).is_err() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("watch '{}' has an invalid action", watch.name),
             });
         }
         if watch.window_secs < MIN_WATCH_WINDOW_SECS {
@@ -485,6 +506,14 @@ pub(crate) fn status_snapshot(state: &AppState) -> serde_json::Value {
 
 /// Builds state with a GitHub source and TOML-configured handlers.
 pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<AppState> {
+    if validate(&config)
+        .iter()
+        .any(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+    {
+        return Err(rite_core::RiteError::Config(
+            "Rite configuration failed validation".to_owned(),
+        ));
+    }
     let mut metrics = Metrics::default();
     metrics.watch_configs.clone_from(&config.watches);
     metrics.watch_state_path = config
@@ -2372,6 +2401,43 @@ action = { type = "http_post", url = "https://example.test/watch" }
         assert!(
             errors.iter().any(|message| message.contains("matcher")),
             "programmatically supplied matchers must be validated: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn direct_watch_config_rejects_an_invalid_action() {
+        let mut config = load_config(
+            r#"[watch_state]
+path = "state.json"
+
+[[watches]]
+name = "malformed-action"
+watch_source = ["github"]
+match = { event_type = "push" }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .unwrap();
+        config.watches[0].action = RiteAction::HttpPost {
+            url: url::Url::parse("https://example.test/watch").unwrap(),
+            headers: BTreeMap::new(),
+            body_template: Some("{{event_type}}".into()),
+            body_json: Some(serde_json::json!({"event":"{{event_type}}"})),
+        };
+
+        let errors = validate(&config)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            errors.iter().any(|message| message.contains("action")),
+            "programmatically supplied actions must be validated: {errors:?}"
+        );
+        assert!(
+            configured_state("synthetic-secret", config).is_err(),
+            "configured_state must not serve a programmatically invalid action"
         );
     }
 
