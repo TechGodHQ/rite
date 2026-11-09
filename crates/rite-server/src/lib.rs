@@ -459,6 +459,9 @@ pub fn initialize_watch_service(state: &mut AppState) -> Result<(), String> {
 
 /// Serve HTTP while supervising the coordinator as a process-critical task.
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> Result<(), String> {
+    if !state.metrics.watch_configs.is_empty() && state.metrics.watch_service.get().is_none() {
+        return Err("configured watches require an initialized watch coordinator".to_owned());
+    }
     start_iris_subscription(&state);
     let watch_service = state.metrics.watch_service.get().cloned();
     let server = axum::serve(listener, app(state));
@@ -1034,6 +1037,29 @@ mod tests {
             watch_state: Some(WatchStateConfig { path: state_path }),
             sources: SourcesConfig::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_configured_watches_without_prebind_initialization() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-uninitialized-{}.json",
+            std::process::id()
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path.clone()),
+        )
+        .unwrap();
+
+        let result = timeout(Duration::from_millis(100), serve(listener, state)).await;
+        assert!(matches!(
+            result,
+            Ok(Err(message)) if message.contains("watch coordinator")
+        ));
+        assert!(!state_path.exists());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
     }
 
     fn signed_github_push(secret: &str, body: &[u8]) -> Request<Body> {
