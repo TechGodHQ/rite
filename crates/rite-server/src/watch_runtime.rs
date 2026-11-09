@@ -1,7 +1,7 @@
 //! Server-owned durable watch coordinator and action execution.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
@@ -109,6 +109,7 @@ pub(crate) struct WatchService {
 struct WatchState {
     store: DurableStore,
     configs: BTreeMap<String, RiteWatch>,
+    live_attempts: BTreeSet<String>,
 }
 
 struct DurableStore {
@@ -229,7 +230,11 @@ impl WatchService {
             .build()
             .map_err(|_| RuntimeError::ActionConstruction)?;
         Ok(Arc::new(Self {
-            state: Mutex::new(WatchState { store, configs }),
+            state: Mutex::new(WatchState {
+                store,
+                configs,
+                live_attempts: BTreeSet::new(),
+            }),
             fatal,
             dispatch_gate,
             client,
@@ -277,7 +282,7 @@ impl WatchService {
                 .utc_at(monotonic_ms)
                 .map_err(|_| RuntimeError::Transition)?;
             let mut changed = false;
-            let WatchState { store, configs } = &mut *state;
+            let WatchState { store, configs, .. } = &mut *state;
             for (name, config) in configs {
                 if !config.matches(event) {
                     continue;
@@ -344,6 +349,7 @@ impl WatchService {
             .utc_at(monotonic_ms)
             .map_err(|_| RuntimeError::Transition)?;
         let names = state.configs.keys().cloned().collect::<Vec<_>>();
+        let live_attempts = state.live_attempts.clone();
         let mut changed = false;
         for name in &names {
             let config = state
@@ -357,6 +363,13 @@ impl WatchService {
                 .watches
                 .get_mut(name)
                 .ok_or(RuntimeError::InvalidState)?;
+            if record
+                .pending
+                .as_ref()
+                .is_some_and(|pending| live_attempts.contains(&pending.id))
+            {
+                continue;
+            }
             if record
                 .exhaust_crashed_final_attempt(now)
                 .map_err(|_| RuntimeError::Transition)?
@@ -386,6 +399,13 @@ impl WatchService {
                 .watches
                 .get_mut(&name)
                 .ok_or(RuntimeError::InvalidState)?;
+            if record
+                .pending
+                .as_ref()
+                .is_some_and(|pending| live_attempts.contains(&pending.id))
+            {
+                continue;
+            }
             if let Some(firing) = record
                 .reserve_attempt(now)
                 .map_err(|_| RuntimeError::Transition)?
@@ -406,6 +426,9 @@ impl WatchService {
                 .advance_time(now)
                 .map_err(|_| RuntimeError::Transition)?;
             state.store.persist()?;
+        }
+        if let Some(reserved) = &reserved {
+            state.live_attempts.insert(reserved.firing.id.clone());
         }
         Ok(reserved)
     }
@@ -521,7 +544,9 @@ impl WatchService {
             return Err(RuntimeError::Fatal);
         }
         let result = Self::finish_locked(&mut state, reserved, accepted, clock);
-        if result.is_err() {
+        if result.is_ok() {
+            state.live_attempts.remove(&reserved.firing.id);
+        } else {
             self.signal_fatal();
         }
         result
@@ -892,6 +917,24 @@ mod tests {
             Err(RuntimeError::Persistence)
         ));
         assert!(service.is_fatal());
+
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn live_attempt_is_not_retried_at_its_crash_recovery_boundary() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://127.0.0.1:9/action")], 0, 0).unwrap();
+        let reserved = service.step_at(60_000).unwrap().unwrap();
+
+        assert!(service.step_at(1_000_000).unwrap().is_none());
+        service.finish(&reserved, false, 1_000_001).unwrap();
+        assert!(service.step_at(1_005_000).unwrap().is_none());
+        let retry = service.step_at(1_005_001).unwrap().unwrap();
+        assert_eq!(retry.firing.attempts_reserved, 2);
 
         drop(service);
         fs::remove_dir_all(dir).unwrap();
