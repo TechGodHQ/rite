@@ -30,6 +30,41 @@ const EVALUATION_INTERVAL: Duration = Duration::from_secs(1);
 const ACTION_TIMEOUT: Duration = Duration::from_millis(ATTEMPT_TIMEOUT_MILLIS as u64);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Atomic gate linearizing action-dispatch authorization with fatal closure.
+pub(crate) struct ActionDispatchGate {
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl Default for ActionDispatchGate {
+    fn default() -> Self {
+        Self {
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl ActionDispatchGate {
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<ActionDispatchPermit> {
+        (!self.closed.load(Ordering::SeqCst)).then(|| ActionDispatchPermit {
+            _gate: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+/// Authorization acquired immediately before invoking an outbound request.
+#[must_use = "keep the permit alive until the request has been dispatched"]
+pub(crate) struct ActionDispatchPermit {
+    _gate: Arc<ActionDispatchGate>,
+}
+
 /// Safe-to-report failures in the required watch runtime.
 #[derive(Debug, Error)]
 pub(crate) enum RuntimeError {
@@ -57,12 +92,16 @@ pub(crate) enum RuntimeError {
     /// A prior fatal admission failure closed the coordinator.
     #[error("watch coordinator is already failed")]
     Fatal,
+    /// An owned action task exited unexpectedly.
+    #[error("watch action task failed")]
+    ActionTaskFailed,
 }
 
 /// Process-owned coordinator; its advisory file lock is held for its lifetime.
 pub(crate) struct WatchService {
     state: Mutex<WatchState>,
     fatal: tokio::sync::watch::Sender<bool>,
+    dispatch_gate: Arc<ActionDispatchGate>,
     client: reqwest::Client,
     monotonic_origin: Instant,
 }
@@ -96,12 +135,15 @@ pub(crate) struct RiteConfigView<'a> {
 
 impl WatchService {
     /// Open, validate, recover and durably commit watch state before listener bind.
-    pub(crate) fn open(config: &RiteConfigView<'_>) -> Result<Option<Arc<Self>>, RuntimeError> {
+    pub(crate) fn open(
+        config: &RiteConfigView<'_>,
+        dispatch_gate: Arc<ActionDispatchGate>,
+    ) -> Result<Option<Arc<Self>>, RuntimeError> {
         if config.watches.is_empty() {
             return Ok(None);
         }
         let path = config.state_path.ok_or(RuntimeError::InvalidState)?;
-        Self::open_inner(path, config.watches, || {
+        Self::open_inner(path, config.watches, dispatch_gate, || {
             let host_utc_ms = system_utc_millis().ok_or(RuntimeError::RecoveryTimeUnavailable)?;
             Ok((host_utc_ms, 0, Instant::now()))
         })
@@ -115,14 +157,18 @@ impl WatchService {
         host_utc_ms: i64,
         monotonic_anchor_ms: u64,
     ) -> Result<Arc<Self>, RuntimeError> {
-        Self::open_inner(path, watches, || {
-            Ok((host_utc_ms, monotonic_anchor_ms, Instant::now()))
-        })
+        Self::open_inner(
+            path,
+            watches,
+            Arc::new(ActionDispatchGate::default()),
+            || Ok((host_utc_ms, monotonic_anchor_ms, Instant::now())),
+        )
     }
 
     fn open_inner(
         path: &Path,
         watches: &[RiteWatch],
+        dispatch_gate: Arc<ActionDispatchGate>,
         sample_clock: impl FnOnce() -> Result<(i64, u64, Instant), RuntimeError>,
     ) -> Result<Arc<Self>, RuntimeError> {
         let configs = watches
@@ -185,6 +231,7 @@ impl WatchService {
         Ok(Arc::new(Self {
             state: Mutex::new(WatchState { store, configs }),
             fatal,
+            dispatch_gate,
             client,
             monotonic_origin,
         }))
@@ -374,13 +421,39 @@ impl WatchService {
     pub(crate) async fn run(self: Arc<Self>) -> Result<(), RuntimeError> {
         let mut interval = tokio::time::interval(EVALUATION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut actions = tokio::task::JoinSet::new();
         loop {
-            interval.tick().await;
-            if let Some(reserved) = self.step_with_clock(|| self.monotonic_millis())? {
-                let accepted = self.execute(&reserved).await;
-                self.finish_with_clock(&reserved, accepted, || self.monotonic_millis())?;
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.schedule_tick(&mut actions, self.monotonic_millis()?)?;
+                }
+                result = actions.join_next(), if !actions.is_empty() => {
+                    match result {
+                        Some(Ok(Err(error))) => return Err(error),
+                        Some(Err(_)) => {
+                            self.signal_fatal();
+                            return Err(RuntimeError::ActionTaskFailed);
+                        }
+                        Some(Ok(Ok(()))) | None => {}
+                    }
+                }
             }
         }
+    }
+
+    fn schedule_tick(
+        self: &Arc<Self>,
+        actions: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+        monotonic_ms: u64,
+    ) -> Result<(), RuntimeError> {
+        if let Some(reserved) = self.step_with_clock(|| Ok(monotonic_ms))? {
+            let service = Arc::clone(self);
+            actions.spawn(async move {
+                let accepted = service.execute(&reserved).await;
+                service.finish_with_clock(&reserved, accepted, || service.monotonic_millis())
+            });
+        }
+        Ok(())
     }
 
     async fn execute(&self, reserved: &ReservedAction) -> bool {
@@ -400,9 +473,11 @@ impl WatchService {
         ) else {
             return false;
         };
-        if self.is_fatal() {
+        // Permit acquisition is the dispatch linearization point; fatal closure
+        // prevents any subsequently authorized action from starting.
+        let Some(_permit) = self.dispatch_gate.try_acquire() else {
             return false;
-        }
+        };
         match timeout(ACTION_TIMEOUT, request.send()).await {
             Ok(Ok(response)) => response.status().is_success(),
             Ok(Err(_)) | Err(_) => false,
@@ -496,10 +571,11 @@ impl WatchService {
     }
 
     pub(crate) fn is_fatal(&self) -> bool {
-        *self.fatal.borrow()
+        self.dispatch_gate.is_closed() || *self.fatal.borrow()
     }
 
     pub(crate) fn signal_fatal(&self) {
+        self.dispatch_gate.close();
         self.fatal.send_replace(true);
     }
 
@@ -725,12 +801,15 @@ mod tests {
             0,
         )
         .unwrap();
+        let in_flight = service.dispatch_gate.try_acquire().unwrap();
         service.signal_fatal();
         let mut receiver = service.fatal.subscribe();
         assert!(
             *receiver.borrow_and_update(),
             "a late subscriber must observe an earlier fatal signal"
         );
+        assert!(service.dispatch_gate.try_acquire().is_none());
+        drop(in_flight);
         drop(service);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1119,6 +1198,47 @@ mod tests {
     ) -> StatusCode {
         accepted.send(()).unwrap();
         std::future::pending().await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_watch_action_does_not_block_the_next_evaluation_tick() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/action", post(hold_connection))
+            .with_state(accepted_tx);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = directory();
+        let path = dir.join("state.json");
+        let url = format!("http://{address}/action");
+        let first = watch(&url);
+        let mut second = watch(&url);
+        second.name = "watch-b".into();
+        let mut service = WatchService::open_at(&path, &[first, second], 0, 0).unwrap();
+        Arc::get_mut(&mut service).unwrap().monotonic_origin = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
+        let runner = Arc::clone(&service);
+        let run = tokio::spawn(async move { runner.run().await });
+
+        accepted_rx.recv().await.expect("first action started");
+        tokio::time::advance(EVALUATION_INTERVAL).await;
+        let next_action = tokio::time::timeout(Duration::from_millis(100), accepted_rx.recv())
+            .await
+            .is_ok_and(|accepted| accepted.is_some());
+
+        run.abort();
+        let _ = run.await;
+        server.abort();
+        let _ = server.await;
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+
+        assert!(
+            next_action,
+            "a pending HTTP action must not stall later deadline evaluation"
+        );
     }
 
     #[tokio::test(start_paused = true)]

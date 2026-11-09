@@ -255,9 +255,9 @@ async fn run_matched_handlers(
                 event,
             ) {
                 Ok(request) => {
-                    if !state.metrics.watch_runtime_is_supervised() {
+                    let Some(_permit) = state.metrics.authorize_action_dispatch() else {
                         return Err(());
-                    }
+                    };
                     match request.send().await {
                         Ok(response) if response.status().is_success() => {
                             executed += 1;

@@ -2,7 +2,7 @@
 
 pub mod dispatch;
 mod watch_runtime;
-use watch_runtime::WatchService;
+use watch_runtime::{ActionDispatchGate, ActionDispatchPermit, WatchService};
 
 use std::{
     collections::BTreeMap,
@@ -15,6 +15,7 @@ use std::{
 };
 
 use axum::{Router, routing::get};
+use rite_core::watch::MIN_WATCH_WINDOW_SECS;
 use rite_core::{
     ACTION_VALIDATION_ERROR_PREFIX, EventSource, MATCH_VALIDATION_ERROR_PREFIX, RiteAction,
     RiteEvent, RiteHandler, RiteWatch,
@@ -110,6 +111,7 @@ pub struct Metrics {
     watch_state_path: Option<PathBuf>,
     watch_service: OnceLock<Arc<WatchService>>,
     watch_supervisor_active: AtomicBool,
+    action_dispatch_gate: Arc<ActionDispatchGate>,
 }
 
 impl Default for Metrics {
@@ -124,6 +126,7 @@ impl Default for Metrics {
             watch_state_path: None,
             watch_service: OnceLock::new(),
             watch_supervisor_active: AtomicBool::new(false),
+            action_dispatch_gate: Arc::new(ActionDispatchGate::default()),
         }
     }
 }
@@ -132,10 +135,17 @@ impl Metrics {
     fn watch_runtime_is_supervised(&self) -> bool {
         self.watch_configs.is_empty()
             || (self.watch_supervisor_active.load(Ordering::Acquire)
+                && !self.action_dispatch_gate.is_closed()
                 && self
                     .watch_service
                     .get()
                     .is_some_and(|service| !service.is_fatal()))
+    }
+
+    fn authorize_action_dispatch(&self) -> Option<ActionDispatchPermit> {
+        self.watch_runtime_is_supervised()
+            .then(|| self.action_dispatch_gate.try_acquire())
+            .flatten()
     }
 }
 
@@ -356,10 +366,19 @@ fn validate_watch_config(
                 message: format!("duplicate watch name '{}'", watch.name),
             });
         }
-        if watch.window_secs < 4 {
+        if watch.condition_tree().is_err() {
             diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Error,
-                message: format!("watch '{}' window_secs must be at least 4", watch.name),
+                message: format!("watch '{}' matcher is malformed", watch.name),
+            });
+        }
+        if watch.window_secs < MIN_WATCH_WINDOW_SECS {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!(
+                    "watch '{}' window_secs must be at least {MIN_WATCH_WINDOW_SECS}",
+                    watch.name
+                ),
             });
         }
         if watch
@@ -504,7 +523,9 @@ pub fn initialize_watch_service(state: &mut AppState) -> Result<(), String> {
         watches: &state.metrics.watch_configs,
         state_path: state.metrics.watch_state_path.as_ref(),
     };
-    if let Some(service) = WatchService::open(&config).map_err(|error| error.to_string())?
+    if let Some(service) =
+        WatchService::open(&config, Arc::clone(&state.metrics.action_dispatch_gate))
+            .map_err(|error| error.to_string())?
         && state.metrics.watch_service.set(service).is_err()
     {
         return Err("watch coordinator already initialized".to_owned());
@@ -692,9 +713,9 @@ fn spawn_iris_action_task(
                     &event,
                 ) {
                     Ok(request) => {
-                        if !action_metrics.watch_runtime_is_supervised() {
+                        let Some(_permit) = action_metrics.authorize_action_dispatch() else {
                             break;
-                        }
+                        };
                         match request.send().await {
                             Ok(response) if response.status().is_success() => {
                                 action_metrics
@@ -2321,6 +2342,37 @@ action = { type = "http_post", url = "https://example.test/watch" }
         assert!(disabled_errors.iter().any(|message| {
             message.contains("unknown or disabled source") && message.contains("iris")
         }));
+    }
+
+    #[test]
+    fn direct_watch_config_rejects_a_malformed_matcher() {
+        let mut config = load_config(
+            r#"[watch_state]
+path = "state.json"
+
+[[watches]]
+name = "malformed"
+watch_source = ["github"]
+match = { event_type = "push" }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .unwrap();
+        config.watches[0].matcher = std::collections::BTreeMap::from([(
+            "any_of".into(),
+            rite_core::MatchValue::Array(Vec::new()),
+        )]);
+
+        let errors = validate(&config)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            errors.iter().any(|message| message.contains("matcher")),
+            "programmatically supplied matchers must be validated: {errors:?}"
+        );
     }
 
     #[test]
