@@ -172,6 +172,15 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
         .metrics
         .events_received
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(watches) = &state.watch_service
+        && watches.observe(&event).is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "watch state admission failed",
+        )
+            .into_response();
+    }
     tracing::info!(source = %event.source, event_type = %event.event_type, action = ?event.action, "Webhook event received");
     let matched = state
         .handlers

@@ -1,0 +1,1022 @@
+//! Server-owned durable watch coordinator and action execution.
+
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use fs2::FileExt;
+use rite_core::{
+    RiteAction, RiteEvent, RiteWatch,
+    watch::{
+        ATTEMPT_TIMEOUT_MILLIS, ClockEpoch, FiringRecord, RecoveredFile, RecoveryClock, WatchError,
+        WatchFile, WatchRecord, action_fingerprint, recover,
+    },
+};
+use thiserror::Error;
+use tokio::time::timeout;
+
+use crate::http_post_request;
+
+const EVALUATION_INTERVAL: Duration = Duration::from_secs(1);
+const ACTION_TIMEOUT: Duration = Duration::from_millis(ATTEMPT_TIMEOUT_MILLIS as u64);
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Safe-to-report failures in the required watch runtime.
+#[derive(Debug, Error)]
+pub(crate) enum RuntimeError {
+    /// State was unreadable, malformed, unsupported or inconsistent.
+    #[error("watch state is unavailable or invalid")]
+    InvalidState,
+    /// A valid record could not be compared against recovery time.
+    #[error("watch recovery requires a comparable host clock")]
+    RecoveryTimeUnavailable,
+    /// A required atomic state transition or filesystem operation failed.
+    #[error("watch state could not be durably updated")]
+    Persistence,
+    /// A checked clock or state-machine transition failed.
+    #[error("watch coordinator transition failed")]
+    Transition,
+    /// A pending firing cannot be paired with its saved non-secret action identity.
+    #[error("pending watch action does not match its saved action identity")]
+    ActionSnapshotMismatch,
+    /// The shared generic action request could not be constructed safely.
+    #[error("watch action request could not be constructed")]
+    ActionConstruction,
+    /// The coordinator lock was poisoned.
+    #[error("watch coordinator state is unavailable")]
+    Poisoned,
+}
+
+/// Process-owned coordinator; its advisory file lock is held for its lifetime.
+pub(crate) struct WatchService {
+    state: Mutex<WatchState>,
+    fatal: tokio::sync::watch::Sender<bool>,
+    client: reqwest::Client,
+    monotonic_origin: Instant,
+}
+
+struct WatchState {
+    store: DurableStore,
+    configs: BTreeMap<String, RiteWatch>,
+}
+
+struct DurableStore {
+    path: PathBuf,
+    _lock: File,
+    file: WatchFile,
+    epoch: ClockEpoch,
+}
+
+/// One reserved attempt, ready for the shared generic HTTP request builder.
+struct ReservedAction {
+    watch_name: String,
+    firing: FiringRecord,
+    action: RiteAction,
+}
+
+/// Read-only config view used by pre-bind serving initialization.
+pub(crate) struct RiteConfigView<'a> {
+    /// Configured watches.
+    pub watches: &'a [RiteWatch],
+    /// Explicit durable state file path.
+    pub state_path: Option<&'a PathBuf>,
+}
+
+impl WatchService {
+    /// Open, validate, recover and durably commit watch state before listener bind.
+    pub(crate) fn open(config: &RiteConfigView<'_>) -> Result<Option<Arc<Self>>, RuntimeError> {
+        if config.watches.is_empty() {
+            return Ok(None);
+        }
+        let path = config.state_path.ok_or(RuntimeError::InvalidState)?;
+        Self::open_inner(path, config.watches, || {
+            let host_utc_ms = system_utc_millis().ok_or(RuntimeError::RecoveryTimeUnavailable)?;
+            Ok((host_utc_ms, 0, Instant::now()))
+        })
+        .map(Some)
+    }
+
+    #[cfg(test)]
+    fn open_at(
+        path: &Path,
+        watches: &[RiteWatch],
+        host_utc_ms: i64,
+        monotonic_anchor_ms: u64,
+    ) -> Result<Arc<Self>, RuntimeError> {
+        Self::open_inner(path, watches, || {
+            Ok((host_utc_ms, monotonic_anchor_ms, Instant::now()))
+        })
+    }
+
+    fn open_inner(
+        path: &Path,
+        watches: &[RiteWatch],
+        sample_clock: impl FnOnce() -> Result<(i64, u64, Instant), RuntimeError>,
+    ) -> Result<Arc<Self>, RuntimeError> {
+        let configs = watches
+            .iter()
+            .cloned()
+            .map(|watch| (watch.name.clone(), watch))
+            .collect::<BTreeMap<_, _>>();
+        if configs.len() != watches.len() {
+            return Err(RuntimeError::InvalidState);
+        }
+        let lock = open_private(&lock_path(path))?;
+        lock.try_lock_exclusive()
+            .map_err(|_| RuntimeError::Persistence)?;
+        let existing = read_state_file(path)?;
+        let (host_utc_ms, monotonic_anchor_ms, monotonic_origin) = sample_clock()?;
+        let mut file = match existing {
+            Some(file) => file,
+            None => WatchFile::empty(host_utc_ms).map_err(|_| RuntimeError::Transition)?,
+        };
+        if !file.watches.is_empty() {
+            recover(
+                &file,
+                RecoveryClock {
+                    host_utc_ms: Some(host_utc_ms),
+                    monotonic_anchor_ms: Some(monotonic_anchor_ms),
+                    // SystemTime is the declared environmental host-time
+                    // assumption; hidden cross-boot manipulation is not detectable here.
+                    host_time_trusted: true,
+                },
+            )
+            .map_err(|error| match error {
+                WatchError::HostTimeUnavailable => RuntimeError::RecoveryTimeUnavailable,
+                WatchError::InvalidRecord => RuntimeError::InvalidState,
+                _ => RuntimeError::Transition,
+            })?;
+        }
+        reconcile_watch_config(&mut file, &configs, host_utc_ms)?;
+        // Record validity is checked independently from host-clock comparability.
+        file.validate().map_err(|_| RuntimeError::InvalidState)?;
+        let recovered = recover(
+            &file,
+            RecoveryClock {
+                host_utc_ms: Some(host_utc_ms),
+                monotonic_anchor_ms: Some(monotonic_anchor_ms),
+                host_time_trusted: true,
+            },
+        )
+        .map_err(|error| match error {
+            WatchError::HostTimeUnavailable => RuntimeError::RecoveryTimeUnavailable,
+            WatchError::InvalidRecord => RuntimeError::InvalidState,
+            _ => RuntimeError::Transition,
+        })?;
+        apply_recovered_records(&mut file, &recovered)?;
+        file.advance_time(host_utc_ms)
+            .map_err(|_| RuntimeError::RecoveryTimeUnavailable)?;
+        file.validate().map_err(|_| RuntimeError::InvalidState)?;
+        let mut store = DurableStore {
+            path: path.to_owned(),
+            _lock: lock,
+            file,
+            epoch: recovered.epoch,
+        };
+        store.persist()?;
+        let (fatal, _) = tokio::sync::watch::channel(false);
+        let client = reqwest::Client::builder()
+            .timeout(ACTION_TIMEOUT)
+            .build()
+            .map_err(|_| RuntimeError::ActionConstruction)?;
+        Ok(Arc::new(Self {
+            state: Mutex::new(WatchState { store, configs }),
+            fatal,
+            client,
+            monotonic_origin,
+        }))
+    }
+
+    /// Observe an already authenticated and normalized external event.
+    pub(crate) fn observe(&self, event: &RiteEvent) -> Result<(), RuntimeError> {
+        let result = self
+            .monotonic_millis()
+            .and_then(|now| self.observe_at(event, now));
+        if result.is_err() {
+            self.signal_fatal();
+        }
+        result
+    }
+
+    fn observe_at(&self, event: &RiteEvent, monotonic_ms: u64) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        let now = state
+            .store
+            .epoch
+            .utc_at(monotonic_ms)
+            .map_err(|_| RuntimeError::Transition)?;
+        let mut changed = false;
+        let configs = state.configs.clone();
+        for (name, config) in &configs {
+            if !config.matches(event) {
+                continue;
+            }
+            let record = state
+                .store
+                .file
+                .watches
+                .get_mut(name)
+                .ok_or(RuntimeError::InvalidState)?;
+            record
+                .observe_heartbeat(now, config.window_secs)
+                .map_err(|_| RuntimeError::Transition)?;
+            changed = true;
+        }
+        if changed {
+            state
+                .store
+                .file
+                .advance_time(now)
+                .map_err(|_| RuntimeError::Transition)?;
+            state.store.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Deterministic coordinator transition; production supplies elapsed monotonic time.
+    fn step_at(&self, monotonic_ms: u64) -> Result<Option<ReservedAction>, RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        let now = state
+            .store
+            .epoch
+            .utc_at(monotonic_ms)
+            .map_err(|_| RuntimeError::Transition)?;
+        let names = state.configs.keys().cloned().collect::<Vec<_>>();
+        let mut changed = false;
+        for name in &names {
+            let config = state
+                .configs
+                .get(name)
+                .cloned()
+                .ok_or(RuntimeError::InvalidState)?;
+            let record = state
+                .store
+                .file
+                .watches
+                .get_mut(name)
+                .ok_or(RuntimeError::InvalidState)?;
+            if record
+                .exhaust_crashed_final_attempt(now)
+                .map_err(|_| RuntimeError::Transition)?
+            {
+                changed = true;
+                continue;
+            }
+            let fingerprint =
+                action_fingerprint(&config.action).map_err(|_| RuntimeError::ActionConstruction)?;
+            if record
+                .fire_if_due(name, now, config.window_secs, &fingerprint)
+                .map_err(|_| RuntimeError::Transition)?
+            {
+                changed = true;
+            }
+        }
+        let mut reserved = None;
+        for name in names {
+            let config = state
+                .configs
+                .get(&name)
+                .cloned()
+                .ok_or(RuntimeError::InvalidState)?;
+            let record = state
+                .store
+                .file
+                .watches
+                .get_mut(&name)
+                .ok_or(RuntimeError::InvalidState)?;
+            if let Some(firing) = record
+                .reserve_attempt(now)
+                .map_err(|_| RuntimeError::Transition)?
+            {
+                changed = true;
+                reserved = Some(ReservedAction {
+                    watch_name: name,
+                    firing,
+                    action: config.action.clone(),
+                });
+                break;
+            }
+        }
+        if changed {
+            state
+                .store
+                .file
+                .advance_time(now)
+                .map_err(|_| RuntimeError::Transition)?;
+            state.store.persist()?;
+        }
+        Ok(reserved)
+    }
+
+    /// Run the supervised one-second evaluator; fatal persistence errors return to the CLI.
+    pub(crate) async fn run(self: Arc<Self>) -> Result<(), RuntimeError> {
+        let mut interval = tokio::time::interval(EVALUATION_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let now = self.monotonic_millis()?;
+            if let Some(reserved) = self.step_at(now)? {
+                let accepted = self.execute(&reserved).await;
+                self.finish(&reserved, accepted, self.monotonic_millis()?)?;
+            }
+        }
+    }
+
+    async fn execute(&self, reserved: &ReservedAction) -> bool {
+        let RiteAction::HttpPost {
+            url,
+            headers,
+            body_template,
+            body_json,
+        } = &reserved.action;
+        let Ok(request) = http_post_request(
+            &self.client,
+            url,
+            headers,
+            body_template.as_deref(),
+            body_json.as_ref(),
+            &reserved.firing.event,
+        ) else {
+            return false;
+        };
+        match timeout(ACTION_TIMEOUT, request.send()).await {
+            Ok(Ok(response)) => response.status().is_success(),
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    fn finish(
+        &self,
+        reserved: &ReservedAction,
+        accepted: bool,
+        monotonic_ms: u64,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        let now = state
+            .store
+            .epoch
+            .utc_at(monotonic_ms)
+            .map_err(|_| RuntimeError::Transition)?;
+        let record = state
+            .store
+            .file
+            .watches
+            .get_mut(&reserved.watch_name)
+            .ok_or(RuntimeError::InvalidState)?;
+        let current = record.pending.as_ref().ok_or(RuntimeError::InvalidState)?;
+        if current.id != reserved.firing.id
+            || current.attempts_reserved != reserved.firing.attempts_reserved
+        {
+            return Err(RuntimeError::InvalidState);
+        }
+        record
+            .complete_attempt(now, accepted)
+            .map_err(|_| RuntimeError::Transition)?;
+        state
+            .store
+            .file
+            .advance_time(now)
+            .map_err(|_| RuntimeError::Transition)?;
+        state.store.persist()?;
+        Ok(())
+    }
+
+    /// Wait for a fatal state-admission failure to be supervised by the CLI.
+    pub(crate) async fn fatal(&self) {
+        let mut receiver = self.fatal.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        let _ = receiver.changed().await;
+    }
+
+    fn signal_fatal(&self) {
+        let _ = self.fatal.send(true);
+    }
+
+    fn monotonic_millis(&self) -> Result<u64, RuntimeError> {
+        u64::try_from(self.monotonic_origin.elapsed().as_millis())
+            .map_err(|_| RuntimeError::Transition)
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Result<WatchFile, RuntimeError> {
+        self.state
+            .lock()
+            .map(|state| state.store.file.clone())
+            .map_err(|_| RuntimeError::Poisoned)
+    }
+}
+
+fn read_state_file(path: &Path) -> Result<Option<WatchFile>, RuntimeError> {
+    let file = match fs::read(path) {
+        Ok(bytes) => {
+            let file: WatchFile =
+                serde_json::from_slice(&bytes).map_err(|_| RuntimeError::InvalidState)?;
+            file.validate().map_err(|_| RuntimeError::InvalidState)?;
+            Some(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(RuntimeError::InvalidState),
+    };
+    Ok(file)
+}
+
+fn reconcile_watch_config(
+    file: &mut WatchFile,
+    configs: &BTreeMap<String, RiteWatch>,
+    host_utc_ms: i64,
+) -> Result<(), RuntimeError> {
+    // The fingerprint is a secret-free immutable binding to a pending action snapshot.
+    for (name, record) in &file.watches {
+        if let (Some(firing), Some(config)) = (&record.pending, configs.get(name)) {
+            let configured_fingerprint =
+                action_fingerprint(&config.action).map_err(|_| RuntimeError::ActionConstruction)?;
+            if configured_fingerprint != firing.action_fingerprint {
+                return Err(RuntimeError::ActionSnapshotMismatch);
+            }
+        }
+    }
+    for (name, record) in &mut file.watches {
+        if !configs.contains_key(name) {
+            record
+                .remove_with_pending(host_utc_ms)
+                .map_err(|_| RuntimeError::Transition)?;
+        }
+    }
+    for (name, watch) in configs {
+        if !file.watches.contains_key(name) {
+            file.watches.insert(
+                name.clone(),
+                WatchRecord::new(host_utc_ms, watch.window_secs)
+                    .map_err(|_| RuntimeError::Transition)?,
+            );
+            tracing::info!(watch = %name, "new dead-man watch armed with a durable initial window");
+        }
+    }
+    Ok(())
+}
+
+impl DurableStore {
+    fn persist(&mut self) -> Result<(), RuntimeError> {
+        self.file
+            .validate()
+            .map_err(|_| RuntimeError::InvalidState)?;
+        let payload = serde_json::to_vec(&self.file).map_err(|_| RuntimeError::Persistence)?;
+        atomic_replace(&self.path, &payload).map_err(|_| RuntimeError::Persistence)
+    }
+}
+
+fn atomic_replace(path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state path has no filename",
+        )
+    })?;
+    let temp_path = loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            filename.to_string_lossy(),
+            std::process::id(),
+            sequence
+        ));
+        match open_private_new(&candidate) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(payload).and_then(|()| file.sync_all()) {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                drop(file);
+                break candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    File::open(parent)?.sync_all()
+}
+
+fn open_private(path: &Path) -> Result<File, RuntimeError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| RuntimeError::Persistence)
+}
+
+fn open_private_new(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn system_utc_millis() -> Option<i64> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(elapsed.as_millis()).ok()
+}
+
+fn apply_recovered_records(
+    file: &mut WatchFile,
+    recovered: &RecoveredFile,
+) -> Result<(), RuntimeError> {
+    for (name, recovered) in &recovered.watches {
+        let record = file
+            .watches
+            .get_mut(name)
+            .ok_or(RuntimeError::InvalidState)?;
+        *record = recovered.record.clone();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heartbeat() -> RiteEvent {
+        RiteEvent {
+            source: "github".into(),
+            event_type: "push".into(),
+            action: None,
+            timestamp: chrono::DateTime::from_timestamp_millis(1).unwrap(),
+            severity: rite_core::Severity::Info,
+            title: "source event".into(),
+            body: Some("synthetic heartbeat payload".into()),
+            metadata: BTreeMap::new(),
+        }
+    }
+    use axum::{Router, http::StatusCode, routing::post};
+    use rite_core::watch::{AttemptPhase, TerminalResult};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        net::SocketAddr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{sync::oneshot, task::JoinHandle};
+    use url::Url;
+
+    fn directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rite-watch-runtime-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).expect("synthetic watch directory");
+        path
+    }
+
+    fn watch(url: &str) -> RiteWatch {
+        RiteWatch {
+            name: "watch-a".into(),
+            watch_source: vec!["github".into()],
+            matcher: BTreeMap::from([(
+                "event_type".into(),
+                rite_core::MatchValue::String("push".into()),
+            )]),
+            window_secs: 60,
+            action: RiteAction::HttpPost {
+                url: Url::parse(url).expect("synthetic URL"),
+                headers: BTreeMap::from([("x-runtime-token".into(), "never-persist-this".into())]),
+                body_template: None,
+                body_json: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_file_reopen_preserves_initial_deadline_and_crash_reservation() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let watch = watch("http://127.0.0.1:9/action");
+        let first = WatchService::open_at(&path, std::slice::from_ref(&watch), 10_000, 0).unwrap();
+        assert_eq!(
+            first.snapshot().unwrap().watches["watch-a"].last_seen_utc_ms,
+            None
+        );
+        let deadline = first.snapshot().unwrap().watches["watch-a"].silence_deadline_utc_ms;
+        assert_eq!(deadline, 70_000);
+        drop(first);
+        let middle =
+            WatchService::open_at(&path, std::slice::from_ref(&watch), 30_000, 700).unwrap();
+        assert_eq!(
+            middle.snapshot().unwrap().watches["watch-a"].silence_deadline_utc_ms,
+            deadline
+        );
+        assert!(middle.step_at(40_699).unwrap().is_none());
+        let reservation = middle
+            .step_at(40_700)
+            .unwrap()
+            .expect("saved boundary fires");
+        assert_eq!(reservation.firing.id, "watch-a:1");
+        assert_eq!(reservation.firing.attempts_reserved, 1);
+        drop(middle);
+        let recovered = WatchService::open_at(&path, &[watch], 70_000, 900).unwrap();
+        let pending = recovered.snapshot().unwrap().watches["watch-a"]
+            .pending
+            .clone()
+            .unwrap();
+        assert!(pending.uncertain);
+        assert_eq!(pending.id, "watch-a:1");
+        assert_eq!(pending.attempts_reserved, 1);
+        let AttemptPhase::Attempting {
+            recovery_at_utc_ms, ..
+        } = pending.phase
+        else {
+            panic!("reservation stays pending")
+        };
+        assert!(recovered.step_at(15_899).unwrap().is_none());
+        let next = recovered
+            .step_at(15_900)
+            .unwrap()
+            .expect("reservation time + timeout + delay");
+        assert_eq!(next.firing.id, pending.id);
+        assert_eq!(next.firing.attempts_reserved, 2);
+        drop(recovered);
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(recovery_at_utc_ms, 85_000);
+    }
+
+    #[test]
+    fn long_downtime_fires_once_on_first_evaluation_without_catchup() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let configured = watch("http://127.0.0.1:9/action");
+        let first =
+            WatchService::open_at(&path, std::slice::from_ref(&configured), 10_000, 0).unwrap();
+        drop(first);
+        let recovered = WatchService::open_at(&path, &[configured], 1_000_000, 0).unwrap();
+        let first_fire = recovered
+            .step_at(0)
+            .unwrap()
+            .expect("long outage is due immediately");
+        assert_eq!(first_fire.firing.id, "watch-a:1");
+        assert!(
+            recovered.step_at(0).unwrap().is_none(),
+            "pending firing prevents catch-up"
+        );
+        assert_eq!(recovered.snapshot().unwrap().watches["watch-a"].sequence, 1);
+        drop(recovered);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn heartbeat_during_backoff_reopens_with_pending_identity_and_retry_boundary_unchanged() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let configured = watch("http://127.0.0.1:9/action");
+        let service =
+            WatchService::open_at(&path, std::slice::from_ref(&configured), 0, 0).unwrap();
+        let attempt = service.step_at(60_000).unwrap().unwrap();
+        service.finish(&attempt, false, 60_001).unwrap();
+        let id = attempt.firing.id;
+        service.observe_at(&heartbeat(), 61_000).unwrap();
+        let saved = service.snapshot().unwrap().watches["watch-a"].clone();
+        assert_eq!(saved.silence_deadline_utc_ms, 121_000);
+        assert_eq!(saved.pending.as_ref().unwrap().id, id);
+        assert_eq!(
+            saved.pending.as_ref().unwrap().phase,
+            AttemptPhase::Waiting {
+                outcome_at_utc_ms: 60_001,
+                retry_at_utc_ms: 65_001,
+            }
+        );
+        drop(service);
+        let recovered = WatchService::open_at(&path, &[configured], 62_000, 100).unwrap();
+        let pending = recovered.snapshot().unwrap().watches["watch-a"].clone();
+        assert_eq!(pending.silence_deadline_utc_ms, 121_000);
+        assert_eq!(pending.pending.as_ref().unwrap().id, id);
+        assert!(recovered.step_at(3_100).unwrap().is_none());
+        let retry = recovered.step_at(3_101).unwrap().unwrap();
+        assert_eq!(retry.firing.id, id);
+        assert_eq!(retry.firing.attempts_reserved, 2);
+        drop(recovered);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    async fn ack(
+        State((counter, state_path, durable_reservations)): State<(
+            Arc<AtomicUsize>,
+            PathBuf,
+            Arc<AtomicUsize>,
+        )>,
+    ) -> StatusCode {
+        let ordinal = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(bytes) = fs::read(state_path)
+            && let Ok(file) = serde_json::from_slice::<WatchFile>(&bytes)
+            && file.watches["watch-a"]
+                .pending
+                .as_ref()
+                .is_some_and(|firing| {
+                    usize::from(firing.attempts_reserved) == ordinal
+                        && matches!(firing.phase, AttemptPhase::Attempting { .. })
+                })
+        {
+            durable_reservations.fetch_add(1, Ordering::Relaxed);
+        }
+        StatusCode::NO_CONTENT
+    }
+    use axum::extract::State;
+
+    async fn receiver(
+        counter: Arc<AtomicUsize>,
+        state_path: PathBuf,
+        durable_reservations: Arc<AtomicUsize>,
+    ) -> (String, oneshot::Sender<()>, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address: SocketAddr = listener.local_addr().unwrap();
+        let (stop, signal) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/action", post(ack)).with_state((
+                    counter,
+                    state_path,
+                    durable_reservations,
+                )),
+            )
+            .with_graceful_shutdown(async { _ = signal.await })
+            .await
+            .unwrap();
+        });
+        (format!("http://{address}/action"), stop, task)
+    }
+
+    async fn hold_connection(
+        State(accepted): State<tokio::sync::mpsc::UnboundedSender<()>>,
+    ) -> StatusCode {
+        accepted.send(()).unwrap();
+        std::future::pending().await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn real_action_request_is_bounded_by_ten_virtual_seconds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/action", post(hold_connection))
+            .with_state(accepted_tx);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = directory();
+        let path = dir.join("state.json");
+        let configured = watch(&format!("http://{address}/action"));
+        let service = WatchService::open_at(&path, &[configured], 0, 0).unwrap();
+        let reserved = service.step_at(60_000).unwrap().unwrap();
+        let runner = Arc::clone(&service);
+        let request = tokio::spawn(async move { runner.execute(&reserved).await });
+        accepted_rx.recv().await.unwrap();
+        tokio::time::advance(ACTION_TIMEOUT).await;
+        assert!(!request.await.unwrap());
+        server.abort();
+        let _ = server.await;
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_receiver_duplicate_tolerance_and_recorded_acceptance_survive_reopen() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let durable_reservations = Arc::new(AtomicUsize::new(0));
+        let (url, stop, task) =
+            receiver(counter.clone(), path.clone(), durable_reservations.clone()).await;
+        let mut configured = watch(&url);
+        configured.window_secs = 4;
+        let service =
+            WatchService::open_at(&path, std::slice::from_ref(&configured), 50_000, 0).unwrap();
+        let reserved = service.step_at(4_000).unwrap().expect("due initial arm");
+        assert_eq!(reserved.firing.event.source, "monitor");
+        assert_eq!(reserved.firing.event.event_type, "deadline_exceeded");
+        assert!(reserved.firing.event.body.is_none());
+        assert!(service.execute(&reserved).await);
+        let firing_id = reserved.firing.id.clone();
+        // Model the remote receiver accepting the request while the local
+        // outcome record is lost: the same stable firing is retried.
+        service.finish(&reserved, false, 4_001).unwrap();
+        let retry = service
+            .step_at(9_001)
+            .unwrap()
+            .expect("persisted five-second wait");
+        assert_eq!(retry.firing.id, firing_id);
+        assert!(service.execute(&retry).await);
+        service.finish(&retry, true, 9_002).unwrap();
+        assert_eq!(durable_reservations.load(Ordering::Relaxed), 2);
+        service.observe_at(&heartbeat(), 9_003).unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        let outcome = service.snapshot().unwrap().watches["watch-a"]
+            .last_outcome
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(outcome.result, TerminalResult::Accepted);
+        assert!(outcome.uncertain);
+        assert_eq!(outcome.attempts_reserved, 2);
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("never-persist-this"));
+        assert!(!saved.contains("heartbeat payload"));
+        drop(service);
+        let reopened = WatchService::open_at(&path, &[configured], 60_000, 100).unwrap();
+        assert!(
+            reopened.snapshot().unwrap().watches["watch-a"]
+                .pending
+                .is_none()
+        );
+        assert_eq!(
+            reopened.snapshot().unwrap().watches["watch-a"]
+                .last_outcome
+                .as_ref()
+                .unwrap()
+                .result,
+            TerminalResult::Accepted
+        );
+        assert!(reopened.step_at(100).unwrap().is_none());
+        let _ = stop.send(());
+        task.await.unwrap();
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn observed_retry_boundaries_exhaust_three_reservations_without_a_fourth() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let configured = watch("http://127.0.0.1:9/action");
+        let service =
+            WatchService::open_at(&path, std::slice::from_ref(&configured), 0, 0).unwrap();
+        let first = service.step_at(60_000).unwrap().unwrap();
+        service.finish(&first, false, 60_001).unwrap();
+        drop(service);
+        let recovered =
+            WatchService::open_at(&path, std::slice::from_ref(&configured), 60_001, 0).unwrap();
+        assert!(recovered.step_at(4_999).unwrap().is_none());
+        let second = recovered.step_at(5_000).unwrap().unwrap();
+        assert_eq!(second.firing.attempts_reserved, 2);
+        recovered.finish(&second, false, 5_001).unwrap();
+        drop(recovered);
+        let final_boot = WatchService::open_at(&path, &[configured], 65_002, 0).unwrap();
+        assert!(final_boot.step_at(29_999).unwrap().is_none());
+        let third = final_boot.step_at(30_000).unwrap().unwrap();
+        assert_eq!(third.firing.attempts_reserved, 3);
+        final_boot.finish(&third, false, 30_001).unwrap();
+        let outcome = final_boot.snapshot().unwrap().watches["watch-a"]
+            .last_outcome
+            .clone()
+            .unwrap();
+        assert_eq!(outcome.result, TerminalResult::RetryExhausted);
+        assert_eq!(outcome.attempts_reserved, 3);
+        assert!(outcome.uncertain);
+        assert!(
+            final_boot.snapshot().unwrap().watches["watch-a"]
+                .pending
+                .is_none()
+        );
+        drop(final_boot);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn durable_file_reopen_preserves_every_crash_ordinal_and_never_reserves_a_fourth() {
+        for ordinal in 1_u8..=3 {
+            let dir = directory();
+            let path = dir.join("state.json");
+            let configured = watch("http://127.0.0.1:9/action");
+            let service =
+                WatchService::open_at(&path, std::slice::from_ref(&configured), 0, 0).unwrap();
+            let first = service.step_at(60_000).unwrap().unwrap();
+            let mut pending = first.firing.clone();
+            if ordinal >= 2 {
+                service.finish(&first, false, 60_001).unwrap();
+                let second = service.step_at(65_001).unwrap().unwrap();
+                pending = second.firing.clone();
+                if ordinal == 3 {
+                    service.finish(&second, false, 65_002).unwrap();
+                    pending = service.step_at(95_002).unwrap().unwrap().firing;
+                }
+            }
+            assert_eq!(pending.attempts_reserved, ordinal);
+            let AttemptPhase::Attempting {
+                reserved_at_utc_ms: reserved_at,
+                ..
+            } = pending.phase
+            else {
+                panic!("attempt ordinal {ordinal} was not durably reserved");
+            };
+            let original_silence_deadline =
+                service.snapshot().unwrap().watches["watch-a"].silence_deadline_utc_ms;
+            drop(service);
+
+            let first_recovery = WatchService::open_at(
+                &path,
+                std::slice::from_ref(&configured),
+                reserved_at + 1_000,
+                100,
+            )
+            .unwrap();
+            assert_eq!(
+                first_recovery.snapshot().unwrap().watches["watch-a"].silence_deadline_utc_ms,
+                original_silence_deadline
+            );
+            assert_eq!(
+                first_recovery.snapshot().unwrap().watches["watch-a"]
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .attempts_reserved,
+                ordinal
+            );
+            drop(first_recovery);
+
+            let recovery_delay = match ordinal {
+                1 => 15_000,
+                2 => 40_000,
+                3 => 10_000,
+                _ => unreachable!(),
+            };
+            let recovery_at = reserved_at + recovery_delay;
+            let second_recovery =
+                WatchService::open_at(&path, &[configured], reserved_at + 2_000, 200).unwrap();
+            let boundary_mono = 200 + u64::try_from(recovery_at - reserved_at - 2_000).unwrap();
+            assert!(
+                second_recovery
+                    .step_at(boundary_mono - 1)
+                    .unwrap()
+                    .is_none()
+            );
+            let due = second_recovery.step_at(boundary_mono).unwrap();
+            if ordinal == 3 {
+                assert!(due.is_none());
+                let record = second_recovery.snapshot().unwrap().watches["watch-a"].clone();
+                assert!(record.pending.is_none());
+                let terminal = record.last_outcome.unwrap();
+                assert_eq!(terminal.result, TerminalResult::RetryExhausted);
+                assert_eq!(terminal.attempts_reserved, 3);
+                assert!(terminal.uncertain);
+            } else {
+                assert_eq!(due.unwrap().firing.attempts_reserved, ordinal + 1);
+            }
+            drop(second_recovery);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn valid_record_plus_host_clock_failure_preserves_the_exact_durable_bytes() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let configured = watch("http://127.0.0.1:9/action");
+        let service =
+            WatchService::open_at(&path, std::slice::from_ref(&configured), 10_000, 0).unwrap();
+        drop(service);
+        let before = fs::read(&path).unwrap();
+        let decoded: WatchFile = serde_json::from_slice(&before).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(
+            recover(
+                &decoded,
+                RecoveryClock {
+                    host_utc_ms: Some(9_999),
+                    monotonic_anchor_ms: Some(0),
+                    host_time_trusted: true
+                }
+            ),
+            Err(WatchError::HostTimeUnavailable)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(WatchService::open_at(&path, &[configured], 9_999, 0).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

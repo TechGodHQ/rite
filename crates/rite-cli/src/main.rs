@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use rite_server::{
-    DiagnosticLevel, app, configured_state, dispatch::OperationInput, load_config,
-    start_iris_subscription, startup_summary, validate,
+    DiagnosticLevel, configured_state, dispatch::OperationInput, initialize_watch_service,
+    load_config, serve, startup_summary, validate,
 };
 
 mod generated {
@@ -132,10 +132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secret = github_webhook_secret.ok_or(
         "--github-webhook-secret or RITE_GITHUB_WEBHOOK_SECRET is required to serve webhooks",
     )?;
-    let state = configured_state(&secret, config.clone())?;
+    let mut state = configured_state(&secret, config.clone())?;
+    initialize_watch_service(&mut state).map_err(std::io::Error::other)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!("{}", startup_summary(&config));
-    start_iris_subscription(&state);
-    axum::serve(listener, app(state)).await?;
+    serve(listener, state)
+        .await
+        .map_err(std::io::Error::other)?;
     Ok(())
 }
