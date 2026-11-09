@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -109,6 +109,7 @@ pub struct Metrics {
     watch_configs: Vec<RiteWatch>,
     watch_state_path: Option<PathBuf>,
     watch_service: OnceLock<Arc<WatchService>>,
+    watch_supervisor_active: AtomicBool,
 }
 
 impl Default for Metrics {
@@ -122,7 +123,14 @@ impl Default for Metrics {
             watch_configs: Vec::new(),
             watch_state_path: None,
             watch_service: OnceLock::new(),
+            watch_supervisor_active: AtomicBool::new(false),
         }
+    }
+}
+
+impl Metrics {
+    fn watch_runtime_is_supervised(&self) -> bool {
+        self.watch_configs.is_empty() || self.watch_supervisor_active.load(Ordering::Acquire)
     }
 }
 
@@ -135,10 +143,20 @@ impl Default for Metrics {
 /// through [`dispatch::execute_raw_operation_http`] so HMAC verification
 /// sees the exact wire bytes and headers.
 pub fn app(state: AppState) -> Router {
+    if !state.metrics.watch_runtime_is_supervised() {
+        return Router::new().fallback(watch_runtime_unavailable);
+    }
     Router::new()
         .route("/health", get(health))
         .merge(dispatch::generated::generated_router())
         .with_state(state)
+}
+
+async fn watch_runtime_unavailable() -> (axum::http::StatusCode, &'static str) {
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "configured watches require supervised serving",
+    )
 }
 
 /// A configuration-load failure safe to display in CLI output and logs.
@@ -462,6 +480,15 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> Result
     if !state.metrics.watch_configs.is_empty() && state.metrics.watch_service.get().is_none() {
         return Err("configured watches require an initialized watch coordinator".to_owned());
     }
+    if !state.metrics.watch_configs.is_empty()
+        && state
+            .metrics
+            .watch_supervisor_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return Err("configured watches already have an active supervisor".to_owned());
+    }
     start_iris_subscription(&state);
     let watch_service = state.metrics.watch_service.get().cloned();
     let server = axum::serve(listener, app(state));
@@ -529,6 +556,10 @@ pub(crate) fn http_post_request(
 
 /// Starts the configured Iris subscription without preventing the HTTP server from starting.
 pub fn start_iris_subscription(state: &AppState) {
+    if !state.metrics.watch_runtime_is_supervised() {
+        tracing::error!("configured watches require supervised serving before Iris subscription");
+        return;
+    }
     let Some(iris) = state.iris.clone() else {
         return;
     };
@@ -1062,6 +1093,49 @@ mod tests {
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
     }
 
+    #[tokio::test]
+    async fn public_app_refuses_configured_watches_without_supervision() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-app-unsupervised-{}.json",
+            std::process::id()
+        ));
+        let state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path),
+        )
+        .unwrap();
+        let response = app(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn raw_event_dispatch_refuses_configured_watches_without_supervision() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-dispatch-unsupervised-{}.json",
+            std::process::id()
+        ));
+        let state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path),
+        )
+        .unwrap();
+        let response = dispatch::execute_raw_operation_http(
+            &state,
+            "receive_event",
+            dispatch::generated::GeneratedRawOperationInput {
+                path: std::collections::BTreeMap::from([("source".into(), "github".into())]),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     fn signed_github_push(secret: &str, body: &[u8]) -> Request<Body> {
         Request::post("/event/github")
             .header("X-GitHub-Event", "push")
@@ -1093,6 +1167,10 @@ mod tests {
         )
         .unwrap();
         initialize_watch_service(&mut state).unwrap();
+        state
+            .metrics
+            .watch_supervisor_active
+            .store(true, Ordering::Release);
         let webhook = app(state);
         let body = br#"{"ref":"refs/heads/main","repository":{"name":"rite"}}"#;
 
@@ -1655,6 +1733,10 @@ action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CO
         let config = load_config(&config_text).expect("path predicate config parses");
         let mut state = configured_state("secret", config).expect("state configures");
         initialize_watch_service(&mut state).expect("Iris watch state initializes");
+        state
+            .metrics
+            .watch_supervisor_active
+            .store(true, Ordering::Release);
         start_iris_subscription(&state);
 
         let mut observed_records = Vec::new();

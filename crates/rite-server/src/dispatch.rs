@@ -139,6 +139,11 @@ pub async fn execute_raw_operation_http(
         raw_body: input.raw_body,
     };
     match operation {
+        "receive_event" if !state.metrics.watch_runtime_is_supervised() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "configured watches require supervised serving" })),
+        )
+            .into_response(),
         "receive_event" => receive_event(state, raw_input).await,
         other => (
             StatusCode::NOT_FOUND,
