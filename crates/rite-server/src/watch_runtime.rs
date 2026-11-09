@@ -310,14 +310,7 @@ impl WatchService {
     /// Deterministic coordinator transition; production supplies elapsed monotonic time.
     #[cfg(test)]
     fn step_at(&self, monotonic_ms: u64) -> Result<Option<ReservedAction>, RuntimeError> {
-        self.step_with_clock(|| Ok(monotonic_ms))
-    }
-
-    fn step_with_clock(
-        &self,
-        clock: impl FnOnce() -> Result<u64, RuntimeError>,
-    ) -> Result<Option<ReservedAction>, RuntimeError> {
-        self.step_with_lock_hook(|| {}, clock)
+        self.step_with_lock_hook(|| {}, || Ok(monotonic_ms))
     }
 
     fn step_with_lock_hook(
@@ -425,7 +418,7 @@ impl WatchService {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.schedule_tick(&mut actions, self.monotonic_millis()?)?;
+                    self.schedule_tick(&mut actions, || self.monotonic_millis())?;
                 }
                 result = actions.join_next(), if !actions.is_empty() => {
                     match result {
@@ -444,9 +437,18 @@ impl WatchService {
     fn schedule_tick(
         self: &Arc<Self>,
         actions: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
-        monotonic_ms: u64,
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
     ) -> Result<(), RuntimeError> {
-        if let Some(reserved) = self.step_with_clock(|| Ok(monotonic_ms))? {
+        self.schedule_tick_with_lock_hook(actions, || {}, clock)
+    }
+
+    fn schedule_tick_with_lock_hook(
+        self: &Arc<Self>,
+        actions: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+        before_lock: impl FnOnce(),
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(reserved) = self.step_with_lock_hook(before_lock, clock)? {
             let service = Arc::clone(self);
             actions.spawn(async move {
                 let accepted = service.execute(&reserved).await;
@@ -999,6 +1001,39 @@ mod tests {
         drop(guard);
         worker.join().unwrap().unwrap();
         assert!(sampled.load(Ordering::Acquire));
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_scheduler_samples_time_after_a_competing_commit() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://localhost/action")], 0, 0).unwrap();
+        let tick = {
+            let mut state = service.state.lock().unwrap();
+            let clock = Arc::new(AtomicU64::new(5_000));
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let runner = Arc::clone(&service);
+            let sampled_clock = Arc::clone(&clock);
+            let tick = tokio::spawn(async move {
+                let mut actions = tokio::task::JoinSet::new();
+                runner.schedule_tick_with_lock_hook(
+                    &mut actions,
+                    move || started_tx.send(()).unwrap(),
+                    move || Ok(sampled_clock.load(Ordering::Relaxed)),
+                )
+            });
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the scheduler reached the coordinator lock");
+            state.store.file.advance_time(6_000).unwrap();
+            state.store.persist().unwrap();
+            clock.store(7_000, Ordering::Relaxed);
+            tick
+        };
+        tick.await.unwrap().unwrap();
         drop(service);
         fs::remove_dir_all(dir).unwrap();
     }
