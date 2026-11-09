@@ -134,6 +134,22 @@ impl Metrics {
     }
 }
 
+struct WatchSupervisorGuard {
+    metrics: Arc<Metrics>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for WatchSupervisorGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .watch_supervisor_active
+            .store(false, Ordering::Release);
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 /// Creates the Rite HTTP application.
 ///
 /// Every route except `/health` comes from the generated hydra surface
@@ -489,7 +505,11 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> Result
     {
         return Err("configured watches already have an active supervisor".to_owned());
     }
-    start_iris_subscription(&state);
+    let mut supervisor = WatchSupervisorGuard {
+        metrics: Arc::clone(&state.metrics),
+        tasks: Vec::new(),
+    };
+    supervisor.tasks = start_iris_subscription_tasks(&state);
     let watch_service = state.metrics.watch_service.get().cloned();
     let server = axum::serve(listener, app(state));
     if let Some(service) = watch_service {
@@ -554,14 +574,24 @@ pub(crate) fn http_post_request(
     }
 }
 
-/// Starts the configured Iris subscription without preventing the HTTP server from starting.
+/// Starts an Iris subscription for configurations without watches.
+///
+/// Configured watches require [`serve`], which owns and supervises the source tasks.
 pub fn start_iris_subscription(state: &AppState) {
-    if !state.metrics.watch_runtime_is_supervised() {
-        tracing::error!("configured watches require supervised serving before Iris subscription");
+    if !state.metrics.watch_configs.is_empty() {
+        tracing::error!("configured watches require serve() to supervise Iris subscription");
         return;
     }
+    drop(start_iris_subscription_tasks(state));
+}
+
+fn start_iris_subscription_tasks(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
+    if !state.metrics.watch_runtime_is_supervised() {
+        tracing::error!("configured watches require supervised serving before Iris subscription");
+        return Vec::new();
+    }
     let Some(iris) = state.iris.clone() else {
-        return;
+        return Vec::new();
     };
     let handlers = Arc::clone(&state.handlers);
     let client = state.client.clone();
@@ -570,9 +600,12 @@ pub fn start_iris_subscription(state: &AppState) {
     let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     let (action_sender, mut action_receiver) = tokio::sync::mpsc::channel(64);
     let action_metrics = Arc::clone(&metrics);
-    tokio::spawn(iris.subscribe(sender));
-    tokio::spawn(async move {
+    let source_task = tokio::spawn(iris.subscribe(sender));
+    let ingress_task = tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {
+            if !metrics.watch_runtime_is_supervised() {
+                break;
+            }
             if let Some(watches) = &watch_service
                 && watches.observe(&event).is_err()
             {
@@ -584,8 +617,11 @@ pub fn start_iris_subscription(state: &AppState) {
             }
         }
     });
-    tokio::spawn(async move {
+    let action_task = tokio::spawn(async move {
         while let Some(event) = action_receiver.recv().await {
+            if !action_metrics.watch_runtime_is_supervised() {
+                break;
+            }
             tracing::info!(source = %event.source, event_type = %event.event_type, action = ?event.action, "Iris event received");
             let matched = handlers
                 .iter()
@@ -597,6 +633,9 @@ pub fn start_iris_subscription(state: &AppState) {
                     .fetch_add(1, Ordering::Relaxed);
             }
             for handler in matched {
+                if !action_metrics.watch_runtime_is_supervised() {
+                    break;
+                }
                 tracing::info!(handler = %handler.name, "Iris event matched handler");
                 let RiteAction::HttpPost {
                     url,
@@ -642,6 +681,7 @@ pub fn start_iris_subscription(state: &AppState) {
             }
         }
     });
+    vec![source_task, ingress_task, action_task]
 }
 
 #[cfg(test)]
@@ -1134,6 +1174,74 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn cancelling_watch_supervisor_clears_shared_readiness() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-supervisor-cancel-{}.json",
+            std::process::id()
+        ));
+        let mut state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path.clone()),
+        )
+        .unwrap();
+        initialize_watch_service(&mut state).unwrap();
+        let retained = state.clone();
+        let metrics = Arc::clone(&state.metrics);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(serve(listener, state));
+        timeout(Duration::from_secs(1), async {
+            while !metrics.watch_supervisor_active.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervisor starts");
+
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+        assert!(!metrics.watch_supervisor_active.load(Ordering::Acquire));
+        let response = app(retained.clone())
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = dispatch::execute_raw_operation_http(
+            &retained,
+            "receive_event",
+            dispatch::generated::GeneratedRawOperationInput {
+                path: std::collections::BTreeMap::from([("source".into(), "github".into())]),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(retained);
+        drop(metrics);
+        std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_file(format!("{}.lock", state_path.display())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_guard_aborts_owned_subscription_tasks() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        let guard = WatchSupervisorGuard {
+            metrics: Arc::new(Metrics::default()),
+            tasks: vec![task],
+        };
+        drop(guard);
+
+        timeout(Duration::from_secs(1), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription task aborts with its supervisor");
     }
 
     fn signed_github_push(secret: &str, body: &[u8]) -> Request<Body> {
@@ -1737,7 +1845,10 @@ action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CO
             .metrics
             .watch_supervisor_active
             .store(true, Ordering::Release);
-        start_iris_subscription(&state);
+        let subscription_guard = WatchSupervisorGuard {
+            metrics: Arc::clone(&state.metrics),
+            tasks: start_iris_subscription_tasks(&state),
+        };
 
         let mut observed_records = Vec::new();
         for _ in 0..expected_records.len() {
@@ -1771,6 +1882,7 @@ action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CO
             expected_records.len() as u64
         );
         shutdown.send(()).expect("action receiver shuts down");
+        drop(subscription_guard);
         let lock_path = watch_state_path.with_file_name(format!(
             "{}.lock",
             watch_state_path.file_name().unwrap().to_string_lossy()

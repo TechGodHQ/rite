@@ -455,7 +455,7 @@ impl WatchService {
     }
 
     fn signal_fatal(&self) {
-        let _ = self.fatal.send(true);
+        self.fatal.send_replace(true);
     }
 
     fn monotonic_millis(&self) -> Result<u64, RuntimeError> {
@@ -668,6 +668,26 @@ mod tests {
                 body_json: None,
             },
         }
+    }
+
+    #[test]
+    fn fatal_signal_is_latched_before_supervisor_subscribes() {
+        let dir = directory();
+        let service = WatchService::open_at(
+            &dir.join("state.json"),
+            &[watch("http://localhost/action")],
+            0,
+            0,
+        )
+        .unwrap();
+        service.signal_fatal();
+        let mut receiver = service.fatal.subscribe();
+        assert!(
+            *receiver.borrow_and_update(),
+            "a late subscriber must observe an earlier fatal signal"
+        );
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
