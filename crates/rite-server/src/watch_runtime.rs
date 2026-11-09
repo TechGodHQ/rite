@@ -54,6 +54,9 @@ pub(crate) enum RuntimeError {
     /// The coordinator lock was poisoned.
     #[error("watch coordinator state is unavailable")]
     Poisoned,
+    /// A prior fatal admission failure closed the coordinator.
+    #[error("watch coordinator is already failed")]
+    Fatal,
 }
 
 /// Process-owned coordinator; its advisory file lock is held for its lifetime.
@@ -189,11 +192,7 @@ impl WatchService {
 
     /// Observe an already authenticated and normalized external event.
     pub(crate) fn observe(&self, event: &RiteEvent) -> Result<(), RuntimeError> {
-        let result = self.observe_with_clock(event, || self.monotonic_millis());
-        if result.is_err() {
-            self.signal_fatal();
-        }
-        result
+        self.observe_with_clock(event, || self.monotonic_millis())
     }
 
     #[cfg(test)]
@@ -216,37 +215,49 @@ impl WatchService {
         clock: impl FnOnce() -> Result<u64, RuntimeError>,
     ) -> Result<(), RuntimeError> {
         before_lock();
-        let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
-        let monotonic_ms = clock()?;
-        let now = state
-            .store
-            .epoch
-            .utc_at(monotonic_ms)
-            .map_err(|_| RuntimeError::Transition)?;
-        let mut changed = false;
-        let WatchState { store, configs } = &mut *state;
-        for (name, config) in configs {
-            if !config.matches(event) {
-                continue;
+        let Ok(mut state) = self.state.lock() else {
+            self.signal_fatal();
+            return Err(RuntimeError::Poisoned);
+        };
+        if self.is_fatal() {
+            return Err(RuntimeError::Fatal);
+        }
+        let result = (|| {
+            let monotonic_ms = clock()?;
+            let now = state
+                .store
+                .epoch
+                .utc_at(monotonic_ms)
+                .map_err(|_| RuntimeError::Transition)?;
+            let mut changed = false;
+            let WatchState { store, configs } = &mut *state;
+            for (name, config) in configs {
+                if !config.matches(event) {
+                    continue;
+                }
+                let record = store
+                    .file
+                    .watches
+                    .get_mut(name)
+                    .ok_or(RuntimeError::InvalidState)?;
+                record
+                    .observe_heartbeat(now, config.window_secs)
+                    .map_err(|_| RuntimeError::Transition)?;
+                changed = true;
             }
-            let record = store
-                .file
-                .watches
-                .get_mut(name)
-                .ok_or(RuntimeError::InvalidState)?;
-            record
-                .observe_heartbeat(now, config.window_secs)
-                .map_err(|_| RuntimeError::Transition)?;
-            changed = true;
+            if changed {
+                store
+                    .file
+                    .advance_time(now)
+                    .map_err(|_| RuntimeError::Transition)?;
+                store.persist()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.signal_fatal();
         }
-        if changed {
-            store
-                .file
-                .advance_time(now)
-                .map_err(|_| RuntimeError::Transition)?;
-            store.persist()?;
-        }
-        Ok(())
+        result
     }
 
     /// Deterministic coordinator transition; production supplies elapsed monotonic time.
@@ -268,7 +279,24 @@ impl WatchService {
         clock: impl FnOnce() -> Result<u64, RuntimeError>,
     ) -> Result<Option<ReservedAction>, RuntimeError> {
         before_lock();
-        let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        let Ok(mut state) = self.state.lock() else {
+            self.signal_fatal();
+            return Err(RuntimeError::Poisoned);
+        };
+        if self.is_fatal() {
+            return Err(RuntimeError::Fatal);
+        }
+        let result = Self::step_locked(&mut state, clock);
+        if result.is_err() {
+            self.signal_fatal();
+        }
+        result
+    }
+
+    fn step_locked(
+        state: &mut WatchState,
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<Option<ReservedAction>, RuntimeError> {
         let monotonic_ms = clock()?;
         let now = state
             .store
@@ -372,6 +400,9 @@ impl WatchService {
         ) else {
             return false;
         };
+        if self.is_fatal() {
+            return false;
+        }
         match timeout(ACTION_TIMEOUT, request.send()).await {
             Ok(Ok(response)) => response.status().is_success(),
             Ok(Err(_)) | Err(_) => false,
@@ -405,7 +436,26 @@ impl WatchService {
         clock: impl FnOnce() -> Result<u64, RuntimeError>,
     ) -> Result<(), RuntimeError> {
         before_lock();
-        let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        let Ok(mut state) = self.state.lock() else {
+            self.signal_fatal();
+            return Err(RuntimeError::Poisoned);
+        };
+        if self.is_fatal() {
+            return Err(RuntimeError::Fatal);
+        }
+        let result = Self::finish_locked(&mut state, reserved, accepted, clock);
+        if result.is_err() {
+            self.signal_fatal();
+        }
+        result
+    }
+
+    fn finish_locked(
+        state: &mut WatchState,
+        reserved: &ReservedAction,
+        accepted: bool,
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<(), RuntimeError> {
         let monotonic_ms = clock()?;
         let now = state
             .store
@@ -445,7 +495,11 @@ impl WatchService {
         let _ = receiver.changed().await;
     }
 
-    fn signal_fatal(&self) {
+    pub(crate) fn is_fatal(&self) -> bool {
+        *self.fatal.borrow()
+    }
+
+    pub(crate) fn signal_fatal(&self) {
         self.fatal.send_replace(true);
     }
 
@@ -677,6 +731,87 @@ mod tests {
             *receiver.borrow_and_update(),
             "a late subscriber must observe an earlier fatal signal"
         );
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fatal_coordinator_rejects_later_observations_without_persisting() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://localhost/action")], 0, 0).unwrap();
+        let bytes_before = fs::read(&path).unwrap();
+        service.signal_fatal();
+
+        assert!(matches!(
+            service.observe_at(&heartbeat(), 10),
+            Err(RuntimeError::Fatal)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn observation_persistence_failure_latches_fatal_before_unlock() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://localhost/action")], 0, 0).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        assert!(matches!(
+            service.observe_at(&heartbeat(), 10),
+            Err(RuntimeError::Persistence)
+        ));
+        assert!(service.is_fatal());
+        assert!(matches!(
+            service.observe_at(&heartbeat(), 20),
+            Err(RuntimeError::Fatal)
+        ));
+
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn evaluator_persistence_failure_latches_fatal_before_unlock() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://localhost/action")], 0, 0).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        assert!(matches!(
+            service.step_at(60_000),
+            Err(RuntimeError::Persistence)
+        ));
+        assert!(service.is_fatal());
+
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completion_persistence_failure_latches_fatal_before_unlock() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://localhost/action")], 0, 0).unwrap();
+        let reserved = service.step_at(60_000).unwrap().unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        assert!(matches!(
+            service.finish(&reserved, true, 60_001),
+            Err(RuntimeError::Persistence)
+        ));
+        assert!(service.is_fatal());
+
         drop(service);
         fs::remove_dir_all(dir).unwrap();
     }

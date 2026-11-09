@@ -130,7 +130,12 @@ impl Default for Metrics {
 
 impl Metrics {
     fn watch_runtime_is_supervised(&self) -> bool {
-        self.watch_configs.is_empty() || self.watch_supervisor_active.load(Ordering::Acquire)
+        self.watch_configs.is_empty()
+            || (self.watch_supervisor_active.load(Ordering::Acquire)
+                && self
+                    .watch_service
+                    .get()
+                    .is_some_and(|service| !service.is_fatal()))
     }
 }
 
@@ -165,14 +170,30 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(dispatch::generated::generated_router())
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state.metrics),
+            enforce_watch_runtime,
+        ))
         .with_state(state)
 }
 
-async fn watch_runtime_unavailable() -> (axum::http::StatusCode, &'static str) {
-    (
+async fn enforce_watch_runtime(
+    axum::extract::State(metrics): axum::extract::State<Arc<Metrics>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if metrics.watch_runtime_is_supervised() {
+        next.run(request).await
+    } else {
+        watch_runtime_unavailable().await
+    }
+}
+
+async fn watch_runtime_unavailable() -> axum::response::Response {
+    axum::response::IntoResponse::into_response((
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
         "configured watches require supervised serving",
-    )
+    ))
 }
 
 /// A configuration-load failure safe to display in CLI output and logs.
@@ -597,11 +618,22 @@ fn start_iris_subscription_tasks(state: &AppState) -> Vec<tokio::task::JoinHandl
     let client = state.client.clone();
     let metrics = Arc::clone(&state.metrics);
     let watch_service = state.metrics.watch_service.get().cloned();
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
-    let (action_sender, mut action_receiver) = tokio::sync::mpsc::channel(64);
+    let (sender, receiver) = tokio::sync::mpsc::channel(64);
+    let (action_sender, action_receiver) = tokio::sync::mpsc::channel(64);
     let action_metrics = Arc::clone(&metrics);
     let source_task = tokio::spawn(iris.subscribe(sender));
-    let ingress_task = tokio::spawn(async move {
+    let ingress_task = spawn_iris_ingress_task(metrics, watch_service, receiver, action_sender);
+    let action_task = spawn_iris_action_task(action_metrics, handlers, client, action_receiver);
+    vec![source_task, ingress_task, action_task]
+}
+
+fn spawn_iris_ingress_task(
+    metrics: Arc<Metrics>,
+    watch_service: Option<Arc<WatchService>>,
+    mut receiver: tokio::sync::mpsc::Receiver<RiteEvent>,
+    action_sender: tokio::sync::mpsc::Sender<RiteEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {
             if !metrics.watch_runtime_is_supervised() {
                 break;
@@ -616,8 +648,16 @@ fn start_iris_subscription_tasks(state: &AppState) -> Vec<tokio::task::JoinHandl
                 break;
             }
         }
-    });
-    let action_task = tokio::spawn(async move {
+    })
+}
+
+fn spawn_iris_action_task(
+    action_metrics: Arc<Metrics>,
+    handlers: Arc<Vec<RiteHandler>>,
+    client: reqwest::Client,
+    mut action_receiver: tokio::sync::mpsc::Receiver<RiteEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         while let Some(event) = action_receiver.recv().await {
             if !action_metrics.watch_runtime_is_supervised() {
                 break;
@@ -651,26 +691,31 @@ fn start_iris_subscription_tasks(state: &AppState) -> Vec<tokio::task::JoinHandl
                     body_json.as_ref(),
                     &event,
                 ) {
-                    Ok(request) => match request.send().await {
-                        Ok(response) if response.status().is_success() => {
-                            action_metrics
-                                .actions_succeeded
-                                .fetch_add(1, Ordering::Relaxed);
-                            tracing::info!(handler = %handler.name, "Iris event action completed");
+                    Ok(request) => {
+                        if !action_metrics.watch_runtime_is_supervised() {
+                            break;
                         }
-                        Ok(response) => {
-                            action_metrics
-                                .actions_failed
-                                .fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(handler = %handler.name, status = %response.status(), "Iris event action returned failure status");
+                        match request.send().await {
+                            Ok(response) if response.status().is_success() => {
+                                action_metrics
+                                    .actions_succeeded
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::info!(handler = %handler.name, "Iris event action completed");
+                            }
+                            Ok(response) => {
+                                action_metrics
+                                    .actions_failed
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(handler = %handler.name, status = %response.status(), "Iris event action returned failure status");
+                            }
+                            Err(_error) => {
+                                action_metrics
+                                    .actions_failed
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(handler = %handler.name, "Iris event action request failed");
+                            }
                         }
-                        Err(_error) => {
-                            action_metrics
-                                .actions_failed
-                                .fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(handler = %handler.name, "Iris event action request failed");
-                        }
-                    },
+                    }
                     Err(error) => {
                         action_metrics
                             .actions_failed
@@ -680,12 +725,12 @@ fn start_iris_subscription_tasks(state: &AppState) -> Vec<tokio::task::JoinHandl
                 }
             }
         }
-    });
-    vec![source_task, ingress_task, action_task]
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use axum::{
         body::{Body, to_bytes},
         extract::State,
@@ -701,6 +746,55 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    struct GatedEventSource {
+        metadata: rite_core::SourceMetadata,
+        entered: mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        parse_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EventSource for GatedEventSource {
+        fn metadata(&self) -> &rite_core::SourceMetadata {
+            &self.metadata
+        }
+
+        async fn verify(
+            &self,
+            _headers: &[(String, String)],
+            _body: &[u8],
+        ) -> rite_core::Result<()> {
+            let _ = self.entered.send(());
+            self.release
+                .lock()
+                .await
+                .take()
+                .expect("test verification gate exists")
+                .await
+                .expect("test verification gate releases");
+            Ok(())
+        }
+
+        async fn parse(
+            &self,
+            _headers: &[(String, String)],
+            _body: &[u8],
+        ) -> rite_core::Result<RiteEvent> {
+            self.parse_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(RiteEvent {
+                source: "github".into(),
+                event_type: "push".into(),
+                action: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(1).unwrap(),
+                severity: rite_core::Severity::Info,
+                title: "gated source event".into(),
+                body: None,
+                metadata: BTreeMap::new(),
+            })
+        }
+    }
 
     fn signature(secret: &str, body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
@@ -1174,6 +1268,86 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn fatal_admission_rejects_already_admitted_and_future_webhooks() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-fatal-admission-{}.json",
+            std::process::id()
+        ));
+        let mut state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path.clone()),
+        )
+        .unwrap();
+        initialize_watch_service(&mut state).unwrap();
+        state
+            .metrics
+            .watch_supervisor_active
+            .store(true, Ordering::Release);
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let source = Arc::new(GatedEventSource {
+            metadata: rite_core::SourceMetadata {
+                id: "github",
+                name: "gated synthetic source",
+                capabilities: &[],
+            },
+            entered: entered_tx,
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+            parse_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let source_for_state: Arc<dyn EventSource> = source.clone();
+        state.sources = Arc::new(BTreeMap::from([("github".to_owned(), source_for_state)]));
+        let router = app(state.clone());
+        let request_state = state.clone();
+        let request = tokio::spawn(async move {
+            dispatch::execute_raw_operation_http(
+                &request_state,
+                "receive_event",
+                dispatch::generated::GeneratedRawOperationInput {
+                    path: BTreeMap::from([("source".into(), "github".into())]),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        entered_rx
+            .recv()
+            .await
+            .expect("request passes the initial dispatch gate");
+        state.metrics.watch_service.get().unwrap().signal_fatal();
+        release_tx.send(()).expect("verification gate releases");
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            source
+                .parse_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "fatal state is checked again after asynchronous source verification"
+        );
+        let response = dispatch::execute_raw_operation_http(
+            &state,
+            "receive_event",
+            dispatch::generated::GeneratedRawOperationInput {
+                path: BTreeMap::from([("source".into(), "github".into())]),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = router
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(state);
+        std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_file(format!("{}.lock", state_path.display())).unwrap();
     }
 
     #[tokio::test]
