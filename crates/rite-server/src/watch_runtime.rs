@@ -198,30 +198,47 @@ impl WatchService {
 
     /// Observe an already authenticated and normalized external event.
     pub(crate) fn observe(&self, event: &RiteEvent) -> Result<(), RuntimeError> {
-        let result = self
-            .monotonic_millis()
-            .and_then(|now| self.observe_at(event, now));
+        let result = self.observe_with_clock(event, || self.monotonic_millis());
         if result.is_err() {
             self.signal_fatal();
         }
         result
     }
 
+    #[cfg(test)]
     fn observe_at(&self, event: &RiteEvent, monotonic_ms: u64) -> Result<(), RuntimeError> {
+        self.observe_with_clock(event, || Ok(monotonic_ms))
+    }
+
+    fn observe_with_clock(
+        &self,
+        event: &RiteEvent,
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        self.observe_with_lock_hook(event, || {}, clock)
+    }
+
+    fn observe_with_lock_hook(
+        &self,
+        event: &RiteEvent,
+        before_lock: impl FnOnce(),
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        before_lock();
         let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        let monotonic_ms = clock()?;
         let now = state
             .store
             .epoch
             .utc_at(monotonic_ms)
             .map_err(|_| RuntimeError::Transition)?;
         let mut changed = false;
-        let configs = state.configs.clone();
-        for (name, config) in &configs {
+        let WatchState { store, configs } = &mut *state;
+        for (name, config) in configs {
             if !config.matches(event) {
                 continue;
             }
-            let record = state
-                .store
+            let record = store
                 .file
                 .watches
                 .get_mut(name)
@@ -232,12 +249,11 @@ impl WatchService {
             changed = true;
         }
         if changed {
-            state
-                .store
+            store
                 .file
                 .advance_time(now)
                 .map_err(|_| RuntimeError::Transition)?;
-            state.store.persist()?;
+            store.persist()?;
         }
         Ok(())
     }
@@ -613,6 +629,41 @@ mod tests {
                 body_json: None,
             },
         }
+    }
+
+    #[test]
+    fn concurrent_heartbeats_sample_clocks_in_durable_lock_order() {
+        const WORKERS: usize = 24;
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://127.0.0.1:9/action")], 0, 0).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(WORKERS));
+        let clock = Arc::new(AtomicUsize::new(1));
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                let start = Arc::clone(&start);
+                let clock = Arc::clone(&clock);
+                std::thread::spawn(move || {
+                    start.wait();
+                    service.observe_with_clock(&heartbeat(), || {
+                        Ok(u64::try_from(clock.fetch_add(1, Ordering::Relaxed)).unwrap())
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let state = service.snapshot().unwrap();
+        assert_eq!(state.high_water_utc_ms, i64::try_from(WORKERS).unwrap());
+        assert_eq!(
+            state.watches["watch-a"].last_seen_utc_ms,
+            Some(i64::try_from(WORKERS).unwrap())
+        );
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

@@ -172,7 +172,7 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
         .metrics
         .events_received
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Some(watches) = &state.watch_service
+    if let Some(watches) = state.metrics.watch_service.get()
         && watches.observe(&event).is_err()
     {
         return (

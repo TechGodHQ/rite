@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -97,9 +97,6 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub iris: Option<IrisSource>,
     pub metrics: Arc<Metrics>,
-    watch_configs: Arc<Vec<RiteWatch>>,
-    watch_state_path: Option<PathBuf>,
-    watch_service: Option<Arc<WatchService>>,
 }
 
 /// Process-local counters exposed by `/status`.
@@ -109,6 +106,9 @@ pub struct Metrics {
     pub actions_succeeded: AtomicU64,
     pub actions_failed: AtomicU64,
     started_at: Instant,
+    watch_configs: Vec<RiteWatch>,
+    watch_state_path: Option<PathBuf>,
+    watch_service: OnceLock<Arc<WatchService>>,
 }
 
 impl Default for Metrics {
@@ -119,6 +119,9 @@ impl Default for Metrics {
             actions_succeeded: AtomicU64::new(0),
             actions_failed: AtomicU64::new(0),
             started_at: Instant::now(),
+            watch_configs: Vec::new(),
+            watch_state_path: None,
+            watch_service: OnceLock::new(),
         }
     }
 }
@@ -257,7 +260,25 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
         }
     }
 
-    diagnostics.extend(validate_watch_config(config, &configured_sources));
+    let enabled_sources = [
+        Some("github"),
+        config
+            .sources
+            .iris
+            .as_ref()
+            .filter(|source| source.enabled)
+            .map(|_| "iris"),
+        config
+            .sources
+            .uptime_kuma
+            .as_ref()
+            .filter(|source| source.enabled)
+            .map(|_| "uptime_kuma"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<std::collections::BTreeSet<_>>();
+    diagnostics.extend(validate_watch_config(config, &enabled_sources));
     diagnostics
 }
 
@@ -323,7 +344,7 @@ fn validate_watch_config(
                 diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Error,
                     message: format!(
-                        "watch '{}' references unknown source '{}'",
+                        "watch '{}' references unknown or disabled source '{}'",
                         watch.name, source
                     ),
                 });
@@ -390,6 +411,12 @@ pub(crate) fn status_snapshot(state: &AppState) -> serde_json::Value {
 
 /// Builds state with a GitHub source and TOML-configured handlers.
 pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<AppState> {
+    let mut metrics = Metrics::default();
+    metrics.watch_configs.clone_from(&config.watches);
+    metrics.watch_state_path = config
+        .watch_state
+        .as_ref()
+        .map(|watch_state| watch_state.path.clone());
     let iris = config
         .sources
         .iris
@@ -409,10 +436,7 @@ pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<A
         sources: Arc::new(sources),
         client: reqwest::Client::new(),
         iris,
-        metrics: Arc::new(Metrics::default()),
-        watch_configs: Arc::new(config.watches),
-        watch_state_path: config.watch_state.map(|watch_state| watch_state.path),
-        watch_service: None,
+        metrics: Arc::new(metrics),
     })
 }
 
@@ -422,17 +446,21 @@ pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<A
 /// function, so reading configuration cannot lock, create or re-arm state.
 pub fn initialize_watch_service(state: &mut AppState) -> Result<(), String> {
     let config = watch_runtime::RiteConfigView {
-        watches: &state.watch_configs,
-        state_path: state.watch_state_path.as_ref(),
+        watches: &state.metrics.watch_configs,
+        state_path: state.metrics.watch_state_path.as_ref(),
     };
-    state.watch_service = WatchService::open(&config).map_err(|error| error.to_string())?;
+    if let Some(service) = WatchService::open(&config).map_err(|error| error.to_string())?
+        && state.metrics.watch_service.set(service).is_err()
+    {
+        return Err("watch coordinator already initialized".to_owned());
+    }
     Ok(())
 }
 
 /// Serve HTTP while supervising the coordinator as a process-critical task.
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> Result<(), String> {
     start_iris_subscription(&state);
-    let watch_service = state.watch_service.clone();
+    let watch_service = state.metrics.watch_service.get().cloned();
     let server = axum::serve(listener, app(state));
     if let Some(service) = watch_service {
         let runner = Arc::clone(&service);
@@ -504,7 +532,7 @@ pub fn start_iris_subscription(state: &AppState) {
     let handlers = Arc::clone(&state.handlers);
     let client = state.client.clone();
     let metrics = Arc::clone(&state.metrics);
-    let watch_service = state.watch_service.clone();
+    let watch_service = state.metrics.watch_service.get().cloned();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     let (action_sender, mut action_receiver) = tokio::sync::mpsc::channel(64);
     let action_metrics = Arc::clone(&metrics);
@@ -1870,9 +1898,35 @@ action = { type = "http_post", url = "https://example.test/watch" }
         assert!(
             errors
                 .iter()
-                .any(|message| message.contains("unknown source")),
-            "watch sources must exist: {errors:?}"
+                .any(|message| message.contains("unknown or disabled source")),
+            "watch sources must be available: {errors:?}"
         );
+
+        let disabled_source = load_config(
+            r#"[watch_state]
+path = "state.json"
+
+[sources.iris]
+enabled = false
+base_url = "http://127.0.0.1:3000"
+
+[[watches]]
+name = "disabled-iris"
+watch_source = ["iris"]
+match = { event_type = "text" }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .expect("disabled-source watch configuration parses");
+        let disabled_errors = validate(&disabled_source)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(disabled_errors.iter().any(|message| {
+            message.contains("unknown or disabled source") && message.contains("iris")
+        }));
     }
 
     #[test]
