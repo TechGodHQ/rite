@@ -62,7 +62,7 @@ pub struct WatchFile {
 impl WatchFile {
     /// Create a validated empty snapshot for a newly configured watch service.
     pub fn empty(now_utc_ms: i64) -> Result<Self, WatchError> {
-        if now_utc_ms < 0 {
+        if !supported_utc_millis(now_utc_ms) {
             return Err(WatchError::TimestampOutOfRange);
         }
         Ok(Self {
@@ -76,8 +76,8 @@ impl WatchFile {
     /// Validate the durable schema and all phase/deadline invariants.
     pub fn validate(&self) -> Result<(), WatchError> {
         if self.version != WATCH_STATE_VERSION
-            || self.high_water_utc_ms < 0
-            || self.written_at_utc_ms < 0
+            || !supported_utc_millis(self.high_water_utc_ms)
+            || !supported_utc_millis(self.written_at_utc_ms)
             || self.written_at_utc_ms > self.high_water_utc_ms
         {
             return Err(WatchError::InvalidRecord);
@@ -90,7 +90,7 @@ impl WatchFile {
 
     /// Commit a logical observation without permitting durable time to move back.
     pub fn advance_time(&mut self, now_utc_ms: i64) -> Result<(), WatchError> {
-        if now_utc_ms < self.high_water_utc_ms || now_utc_ms < 0 {
+        if now_utc_ms < self.high_water_utc_ms || !supported_utc_millis(now_utc_ms) {
             return Err(WatchError::HostTimeUnavailable);
         }
         self.high_water_utc_ms = now_utc_ms;
@@ -141,16 +141,19 @@ impl WatchRecord {
     pub fn validate(&self, name: &str, high_water_utc_ms: i64) -> Result<(), WatchError> {
         if name.trim().is_empty()
             || self.window_secs < MIN_WATCH_WINDOW_SECS
-            || self.arm_started_utc_ms < 0
+            || !supported_utc_millis(self.arm_started_utc_ms)
+            || !supported_utc_millis(self.silence_deadline_utc_ms)
             || self.arm_started_utc_ms > high_water_utc_ms
             || add_window(self.arm_started_utc_ms, self.window_secs)?
                 != self.silence_deadline_utc_ms
             || self.last_seen_utc_ms.is_some_and(|time| {
-                time < 0 || time > high_water_utc_ms || time > self.arm_started_utc_ms
+                !supported_utc_millis(time)
+                    || time > high_water_utc_ms
+                    || time > self.arm_started_utc_ms
             })
             || self
                 .last_fired_utc_ms
-                .is_some_and(|time| time < 0 || time > high_water_utc_ms)
+                .is_some_and(|time| !supported_utc_millis(time) || time > high_water_utc_ms)
         {
             return Err(WatchError::InvalidRecord);
         }
@@ -391,7 +394,7 @@ impl FiringRecord {
         if self.sequence == 0
             || self.sequence > sequence
             || self.id != format!("{name}:{}", self.sequence)
-            || self.created_at_utc_ms < 0
+            || !supported_utc_millis(self.created_at_utc_ms)
             || self.created_at_utc_ms > high_water_utc_ms
             || self.event.timestamp.timestamp_millis() != self.created_at_utc_ms
             || self.event.source != "monitor"
@@ -404,6 +407,7 @@ impl FiringRecord {
             || self.event.metadata.get("firing_id") != Some(&json!(self.id))
             || !valid_fingerprint(&self.action_fingerprint)
             || self.attempts_reserved > MAX_ATTEMPTS
+            || !self.phase.timestamps_supported()
         {
             return Err(WatchError::InvalidRecord);
         }
@@ -460,6 +464,24 @@ pub enum AttemptPhase {
     },
 }
 
+impl AttemptPhase {
+    fn timestamps_supported(self) -> bool {
+        match self {
+            Self::Ready { eligible_utc_ms } => supported_utc_millis(eligible_utc_ms),
+            Self::Attempting {
+                reserved_at_utc_ms,
+                recovery_at_utc_ms,
+            } => {
+                supported_utc_millis(reserved_at_utc_ms) && supported_utc_millis(recovery_at_utc_ms)
+            }
+            Self::Waiting {
+                outcome_at_utc_ms,
+                retry_at_utc_ms,
+            } => supported_utc_millis(outcome_at_utc_ms) && supported_utc_millis(retry_at_utc_ms),
+        }
+    }
+}
+
 /// Outcome retained after a firing becomes terminal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -482,7 +504,7 @@ impl TerminalOutcome {
     fn validate(&self, sequence: u64, high_water_utc_ms: i64) -> Result<(), WatchError> {
         if self.sequence == 0
             || self.sequence > sequence
-            || self.finished_at_utc_ms < 0
+            || !supported_utc_millis(self.finished_at_utc_ms)
             || self.finished_at_utc_ms > high_water_utc_ms
             || self.attempts_reserved > MAX_ATTEMPTS
             || (self.result == TerminalResult::Accepted && self.attempts_reserved == 0)
@@ -554,13 +576,21 @@ impl ClockEpoch {
             .checked_sub(self.monotonic_origin_ms)
             .ok_or(WatchError::ClockOverflow)?;
         let elapsed = i64::try_from(elapsed).map_err(|_| WatchError::ClockOverflow)?;
-        self.utc_origin_ms
+        let utc_ms = self
+            .utc_origin_ms
             .checked_add(elapsed)
-            .ok_or(WatchError::ClockOverflow)
+            .ok_or(WatchError::ClockOverflow)?;
+        if !supported_utc_millis(utc_ms) {
+            return Err(WatchError::TimestampOutOfRange);
+        }
+        Ok(utc_ms)
     }
 
     /// Map one unchanged absolute UTC boundary into this process epoch.
     pub fn map_boundary(self, boundary_utc_ms: i64) -> Result<u64, WatchError> {
+        if !supported_utc_millis(boundary_utc_ms) {
+            return Err(WatchError::TimestampOutOfRange);
+        }
         if boundary_utc_ms <= self.utc_origin_ms {
             return Ok(self.monotonic_origin_ms);
         }
@@ -579,7 +609,7 @@ pub fn recover(file: &WatchFile, clock: RecoveryClock) -> Result<RecoveredFile, 
     file.validate()?;
     let host_utc_ms = clock
         .host_utc_ms
-        .filter(|time| *time >= file.high_water_utc_ms && *time >= 0)
+        .filter(|time| *time >= file.high_water_utc_ms && supported_utc_millis(*time))
         .filter(|_| clock.host_time_trusted)
         .ok_or(WatchError::HostTimeUnavailable)?;
     let monotonic_anchor_ms = clock
@@ -669,12 +699,20 @@ pub fn new_record_for_config(
 }
 
 fn add_window(now_utc_ms: i64, window_secs: u64) -> Result<i64, WatchError> {
-    if now_utc_ms < 0 {
+    if !supported_utc_millis(now_utc_ms) {
         return Err(WatchError::TimestampOutOfRange);
     }
-    now_utc_ms
+    let deadline = now_utc_ms
         .checked_add(window_millis(window_secs)?)
-        .ok_or(WatchError::ClockOverflow)
+        .ok_or(WatchError::ClockOverflow)?;
+    if !supported_utc_millis(deadline) {
+        return Err(WatchError::TimestampOutOfRange);
+    }
+    Ok(deadline)
+}
+
+fn supported_utc_millis(value: i64) -> bool {
+    DateTime::<Utc>::from_timestamp_millis(value).is_some()
 }
 
 fn expected_crash_recovery_at(reserved_at_utc_ms: i64, ordinal: u8) -> Result<i64, WatchError> {
@@ -969,6 +1007,30 @@ mod tests {
             Err(WatchError::InvalidRecord),
             "invalid durable bytes are classified before host-clock comparability"
         );
+    }
+
+    #[test]
+    fn recovery_rejects_host_utc_outside_supported_event_timestamp_range() {
+        let file = WatchFile {
+            version: WATCH_STATE_VERSION,
+            high_water_utc_ms: 10_000,
+            written_at_utc_ms: 10_000,
+            watches: BTreeMap::from([("watch".into(), record())]),
+        };
+        let before = serde_json::to_vec(&file).unwrap();
+
+        assert_eq!(
+            recover(
+                &file,
+                RecoveryClock {
+                    host_utc_ms: Some(i64::MAX),
+                    monotonic_anchor_ms: Some(0),
+                    host_time_trusted: true,
+                }
+            ),
+            Err(WatchError::HostTimeUnavailable)
+        );
+        assert_eq!(serde_json::to_vec(&file).unwrap(), before);
     }
 
     #[test]

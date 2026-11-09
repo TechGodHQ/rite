@@ -259,8 +259,26 @@ impl WatchService {
     }
 
     /// Deterministic coordinator transition; production supplies elapsed monotonic time.
+    #[cfg(test)]
     fn step_at(&self, monotonic_ms: u64) -> Result<Option<ReservedAction>, RuntimeError> {
+        self.step_with_clock(|| Ok(monotonic_ms))
+    }
+
+    fn step_with_clock(
+        &self,
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<Option<ReservedAction>, RuntimeError> {
+        self.step_with_lock_hook(|| {}, clock)
+    }
+
+    fn step_with_lock_hook(
+        &self,
+        before_lock: impl FnOnce(),
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<Option<ReservedAction>, RuntimeError> {
+        before_lock();
         let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        let monotonic_ms = clock()?;
         let now = state
             .store
             .epoch
@@ -339,10 +357,9 @@ impl WatchService {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let now = self.monotonic_millis()?;
-            if let Some(reserved) = self.step_at(now)? {
+            if let Some(reserved) = self.step_with_clock(|| self.monotonic_millis())? {
                 let accepted = self.execute(&reserved).await;
-                self.finish(&reserved, accepted, self.monotonic_millis()?)?;
+                self.finish_with_clock(&reserved, accepted, || self.monotonic_millis())?;
             }
         }
     }
@@ -370,13 +387,35 @@ impl WatchService {
         }
     }
 
+    #[cfg(test)]
     fn finish(
         &self,
         reserved: &ReservedAction,
         accepted: bool,
         monotonic_ms: u64,
     ) -> Result<(), RuntimeError> {
+        self.finish_with_clock(reserved, accepted, || Ok(monotonic_ms))
+    }
+
+    fn finish_with_clock(
+        &self,
+        reserved: &ReservedAction,
+        accepted: bool,
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        self.finish_with_lock_hook(reserved, accepted, || {}, clock)
+    }
+
+    fn finish_with_lock_hook(
+        &self,
+        reserved: &ReservedAction,
+        accepted: bool,
+        before_lock: impl FnOnce(),
+        clock: impl FnOnce() -> Result<u64, RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        before_lock();
         let mut state = self.state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        let monotonic_ms = clock()?;
         let now = state
             .store
             .epoch
@@ -598,7 +637,7 @@ mod tests {
         collections::BTreeMap,
         fs,
         net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::{sync::oneshot, task::JoinHandle};
     use url::Url;
@@ -662,6 +701,67 @@ mod tests {
             state.watches["watch-a"].last_seen_utc_ms,
             Some(i64::try_from(WORKERS).unwrap())
         );
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn evaluator_samples_monotonic_time_after_acquiring_state_lock() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://127.0.0.1:9/action")], 0, 0).unwrap();
+        let guard = service.state.lock().unwrap();
+        let sampled = Arc::new(AtomicBool::new(false));
+        let (started, waiting) = std::sync::mpsc::channel();
+        let runner = Arc::clone(&service);
+        let worker_sampled = Arc::clone(&sampled);
+        let worker = std::thread::spawn(move || {
+            runner.step_with_lock_hook(
+                || started.send(()).unwrap(),
+                || {
+                    worker_sampled.store(true, Ordering::Release);
+                    Ok(0)
+                },
+            )
+        });
+        waiting.recv().unwrap();
+        assert!(!sampled.load(Ordering::Acquire));
+        drop(guard);
+        worker.join().unwrap().unwrap();
+        assert!(sampled.load(Ordering::Acquire));
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn action_completion_samples_monotonic_time_after_acquiring_state_lock() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let service =
+            WatchService::open_at(&path, &[watch("http://127.0.0.1:9/action")], 0, 0).unwrap();
+        let reserved = service.step_at(60_000).unwrap().unwrap();
+        let guard = service.state.lock().unwrap();
+        let sampled = Arc::new(AtomicBool::new(false));
+        let (started, waiting) = std::sync::mpsc::channel();
+        let runner = Arc::clone(&service);
+        let worker_sampled = Arc::clone(&sampled);
+        let worker = std::thread::spawn(move || {
+            runner.finish_with_lock_hook(
+                &reserved,
+                true,
+                || started.send(()).unwrap(),
+                || {
+                    worker_sampled.store(true, Ordering::Release);
+                    Ok(60_001)
+                },
+            )
+        });
+        waiting.recv().unwrap();
+        assert!(!sampled.load(Ordering::Acquire));
+        drop(guard);
+        worker.join().unwrap().unwrap();
+        assert!(sampled.load(Ordering::Acquire));
         drop(service);
         fs::remove_dir_all(dir).unwrap();
     }

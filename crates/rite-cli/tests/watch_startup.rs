@@ -5,12 +5,14 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct ChildGuard(Child);
 
@@ -64,7 +66,8 @@ fn serving_a_new_watch_commits_its_initial_arm_before_accepting_traffic() {
     let mut child = ChildGuard(child);
 
     let mut state_bytes = None;
-    for _ in 0..100_000 {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while Instant::now() < deadline {
         if let Some(status) = child.0.try_wait().expect("inspect Rite process") {
             panic!("Rite exited before creating watch state: {status}");
         }
@@ -116,7 +119,8 @@ fn invalid_durable_record_exits_before_the_cli_binds_and_preserves_saved_bytes()
         .expect("start isolated Rite process");
     let mut child = ChildGuard(child);
     let mut exit_status = None;
-    for _ in 0..100_000 {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while Instant::now() < deadline {
         if let Some(status) = child.0.try_wait().expect("inspect pre-bind failure") {
             exit_status = Some(status);
             break;
@@ -175,7 +179,8 @@ fn required_runtime_persistence_failure_exits_cli_and_closes_serving_listener() 
         .expect("start isolated Rite process");
     let mut child = ChildGuard(child);
     let mut ready = false;
-    for _ in 0..100_000 {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while Instant::now() < deadline {
         if let Some(status) = child.0.try_wait().expect("inspect Rite process") {
             panic!("Rite exited before readiness: {status}");
         }
@@ -205,7 +210,8 @@ fn required_runtime_persistence_failure_exits_cli_and_closes_serving_listener() 
     let _ = exchange(address, &request);
 
     let mut exit_status = None;
-    for _ in 0..100_000 {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while Instant::now() < deadline {
         if let Some(status) = child.0.try_wait().expect("inspect supervised exit") {
             exit_status = Some(status);
             break;
