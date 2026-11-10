@@ -169,6 +169,18 @@ impl WatchRecord {
                 high_water_utc_ms,
             )?;
         }
+        let terminal_sequence_consistent = match (&self.pending, &self.last_outcome) {
+            (None, None) => self.sequence == 0,
+            (None, Some(outcome)) => outcome.sequence == self.sequence,
+            (Some(pending), None) => pending.sequence == 1,
+            (Some(pending), Some(outcome)) => {
+                outcome.sequence.checked_add(1) == Some(pending.sequence)
+                    && outcome.finished_at_utc_ms <= pending.created_at_utc_ms
+            }
+        };
+        if !terminal_sequence_consistent {
+            return Err(WatchError::InvalidRecord);
+        }
         Ok(())
     }
 
@@ -1176,6 +1188,65 @@ mod tests {
         for invalid in invalid_files {
             assert!(matches!(invalid.validate(), Err(WatchError::InvalidRecord)));
         }
+    }
+
+    #[test]
+    fn terminal_history_must_be_contiguous_and_precede_the_pending_firing() {
+        let mut completed = record();
+        due_firing(&mut completed);
+        completed.reserve_attempt(60_000).unwrap();
+        completed.complete_attempt(61_000, true).unwrap();
+        let make_file = |record, now| WatchFile {
+            version: WATCH_STATE_VERSION,
+            high_water_utc_ms: now,
+            written_at_utc_ms: now,
+            watches: BTreeMap::from([("watch".into(), record)]),
+        };
+        make_file(completed.clone(), 61_000)
+            .validate()
+            .expect("latest completed sequence is valid");
+
+        let mut skipped_sequence = completed.clone();
+        skipped_sequence.sequence = 2;
+        assert!(matches!(
+            make_file(skipped_sequence, 61_000).validate(),
+            Err(WatchError::InvalidRecord)
+        ));
+
+        let mut next_firing = completed;
+        assert!(
+            next_firing
+                .fire_if_due("watch", 120_000, 60, &fingerprint())
+                .unwrap()
+        );
+        make_file(next_firing.clone(), 120_000)
+            .validate()
+            .expect("the immediately preceding outcome can accompany the next firing");
+
+        let mut skipped_pending_sequence = next_firing.clone();
+        let pending = skipped_pending_sequence.pending.as_mut().unwrap();
+        pending.sequence = 3;
+        pending.id = "watch:3".into();
+        pending
+            .event
+            .metadata
+            .insert("firing_id".into(), json!("watch:3"));
+        skipped_pending_sequence.sequence = 3;
+        assert!(matches!(
+            make_file(skipped_pending_sequence, 120_000).validate(),
+            Err(WatchError::InvalidRecord)
+        ));
+
+        let mut outcome_after_pending_started = next_firing;
+        outcome_after_pending_started
+            .last_outcome
+            .as_mut()
+            .unwrap()
+            .finished_at_utc_ms = 120_001;
+        assert!(matches!(
+            make_file(outcome_after_pending_started, 120_001).validate(),
+            Err(WatchError::InvalidRecord)
+        ));
     }
 
     #[test]
