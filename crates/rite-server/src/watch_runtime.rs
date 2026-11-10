@@ -17,8 +17,8 @@ use fs2::FileExt;
 use rite_core::{
     RiteAction, RiteEvent, RiteWatch,
     watch::{
-        ATTEMPT_TIMEOUT_MILLIS, ClockEpoch, FiringRecord, RecoveredFile, RecoveryClock, WatchError,
-        WatchFile, WatchRecord, action_fingerprint, recover,
+        ATTEMPT_TIMEOUT_MILLIS, AttemptPhase, ClockEpoch, FiringRecord, RecoveredFile,
+        RecoveryClock, WatchError, WatchFile, WatchRecord, action_fingerprint, recover,
     },
 };
 use thiserror::Error;
@@ -130,9 +130,7 @@ struct LiveAttemptCleanup(Arc<WatchService>);
 
 impl Drop for LiveAttemptCleanup {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0.state.lock() {
-            state.live_attempts.clear();
-        }
+        self.0.close_live_attempts();
     }
 }
 
@@ -250,6 +248,51 @@ impl WatchService {
             client,
             monotonic_origin,
         }))
+    }
+
+    fn close_live_attempts(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            self.signal_fatal();
+            return;
+        };
+        if state.live_attempts.is_empty() {
+            return;
+        }
+        let live_attempts = state.live_attempts.clone();
+        let mut changed = false;
+        for record in state.store.file.watches.values_mut() {
+            if let Some(pending) = record.pending.as_mut()
+                && live_attempts.contains(&(pending.id.clone(), pending.attempts_reserved))
+                && matches!(pending.phase, AttemptPhase::Attempting { .. })
+                && !pending.uncertain
+            {
+                pending.uncertain = true;
+                changed = true;
+            }
+        }
+        if changed {
+            let persist_result = self
+                .monotonic_millis()
+                .and_then(|monotonic_ms| {
+                    state
+                        .store
+                        .epoch
+                        .utc_at(monotonic_ms)
+                        .map_err(|_| RuntimeError::Transition)
+                })
+                .and_then(|now| {
+                    state
+                        .store
+                        .file
+                        .advance_time(now)
+                        .map_err(|_| RuntimeError::Transition)?;
+                    state.store.persist()
+                });
+            if persist_result.is_err() {
+                self.signal_fatal();
+            }
+        }
+        state.live_attempts.clear();
     }
 
     /// Observe an already authenticated and normalized external event.
@@ -1321,6 +1364,13 @@ mod tests {
             .expect("first live attempt started");
         run.abort();
         let _ = run.await;
+        assert!(
+            service.snapshot().unwrap().watches["watch-a"]
+                .pending
+                .as_ref()
+                .unwrap()
+                .uncertain
+        );
         let retry = service
             .step_at(1_000_000)
             .unwrap()
