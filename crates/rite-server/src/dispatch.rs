@@ -8,7 +8,7 @@
 //! the same status/message pair.
 
 use axum::{Json, http::StatusCode, response::IntoResponse};
-use rite_core::RiteAction;
+use rite_core::{RiteAction, RiteEvent, RiteHandler};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -139,6 +139,11 @@ pub async fn execute_raw_operation_http(
         raw_body: input.raw_body,
     };
     match operation {
+        "receive_event" if !state.metrics.watch_runtime_is_supervised() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "configured watches require supervised serving" })),
+        )
+            .into_response(),
         "receive_event" => receive_event(state, raw_input).await,
         other => (
             StatusCode::NOT_FOUND,
@@ -146,6 +151,14 @@ pub async fn execute_raw_operation_http(
         )
             .into_response(),
     }
+}
+
+fn watch_runtime_unavailable() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "configured watches require supervised serving" })),
+    )
+        .into_response()
 }
 
 /// Webhook ingress: verify the delivery signature, normalize the payload,
@@ -164,14 +177,32 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
     if let Err(error) = source.verify(&input.headers, &input.raw_body).await {
         return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
     }
+    if !state.metrics.watch_runtime_is_supervised() {
+        return watch_runtime_unavailable();
+    }
     let event = match source.parse(&input.headers, &input.raw_body).await {
         Ok(event) => event,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
+    if !state.metrics.watch_runtime_is_supervised() {
+        return watch_runtime_unavailable();
+    }
     state
         .metrics
         .events_received
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(watches) = state.metrics.watch_service.get()
+        && watches.observe(&event).is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "watch state admission failed",
+        )
+            .into_response();
+    }
+    if !state.metrics.watch_runtime_is_supervised() {
+        return watch_runtime_unavailable();
+    }
     tracing::info!(source = %event.source, event_type = %event.event_type, action = ?event.action, "Webhook event received");
     let matched = state
         .handlers
@@ -184,8 +215,30 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
             .events_matched
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    let Ok(executed) = run_matched_handlers(state, &event, &matched).await else {
+        return watch_runtime_unavailable();
+    };
+    let matched_handlers = matched
+        .into_iter()
+        .map(|handler| handler.name.clone())
+        .collect::<Vec<_>>();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"event": event, "matched_handlers": matched_handlers, "actions_executed": executed})),
+    )
+        .into_response()
+}
+
+async fn run_matched_handlers(
+    state: &AppState,
+    event: &RiteEvent,
+    matched: &[&RiteHandler],
+) -> Result<usize, ()> {
     let mut executed = 0_usize;
-    for handler in &matched {
+    for handler in matched {
+        if !state.metrics.watch_runtime_is_supervised() {
+            return Err(());
+        }
         tracing::info!(handler = %handler.name, "Webhook event matched handler");
         match &handler.action {
             RiteAction::HttpPost {
@@ -199,32 +252,37 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
                 headers,
                 body_template.as_deref(),
                 body_json.as_ref(),
-                &event,
+                event,
             ) {
-                Ok(request) => match request.send().await {
-                    Ok(response) if response.status().is_success() => {
-                        executed += 1;
-                        state
-                            .metrics
-                            .actions_succeeded
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::info!(handler = %handler.name, status = %response.status(), "rite action completed");
+                Ok(request) => {
+                    let Some(_permit) = state.metrics.authorize_action_dispatch() else {
+                        return Err(());
+                    };
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => {
+                            executed += 1;
+                            state
+                                .metrics
+                                .actions_succeeded
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::info!(handler = %handler.name, status = %response.status(), "rite action completed");
+                        }
+                        Ok(response) => {
+                            state
+                                .metrics
+                                .actions_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(handler = %handler.name, status = %response.status(), "rite action returned failure status");
+                        }
+                        Err(_error) => {
+                            state
+                                .metrics
+                                .actions_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(handler = %handler.name, "rite action request failed");
+                        }
                     }
-                    Ok(response) => {
-                        state
-                            .metrics
-                            .actions_failed
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(handler = %handler.name, status = %response.status(), "rite action returned failure status");
-                    }
-                    Err(_error) => {
-                        state
-                            .metrics
-                            .actions_failed
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::warn!(handler = %handler.name, "rite action request failed");
-                    }
-                },
+                }
                 Err(error) => {
                     state
                         .metrics
@@ -235,15 +293,7 @@ async fn receive_event(state: &AppState, input: RawOperationInput) -> axum::resp
             },
         }
     }
-    let matched_handlers = matched
-        .into_iter()
-        .map(|handler| handler.name.clone())
-        .collect::<Vec<_>>();
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"event": event, "matched_handlers": matched_handlers, "actions_executed": executed})),
-    )
-        .into_response()
+    Ok(executed)
 }
 
 #[allow(clippy::unused_async)]

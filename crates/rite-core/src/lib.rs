@@ -1,4 +1,5 @@
-//! Domain contracts for Rite event sources, handlers, and actions.
+/// Domain contracts for Rite event sources, handlers, and actions.
+pub mod watch;
 
 use std::collections::BTreeMap;
 
@@ -355,6 +356,41 @@ impl RiteHandler {
     }
 }
 
+/// A configured dead-man watch evaluated against authenticated external events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiteWatch {
+    /// Human-readable unique watch name.
+    pub name: String,
+    /// Source IDs whose matching events reset the silence timer.
+    pub watch_source: Vec<String>,
+    /// Compound condition that an admitted external event must satisfy.
+    #[serde(rename = "match", deserialize_with = "deserialize_validated_matcher")]
+    pub matcher: BTreeMap<String, MatchValue>,
+    /// Silence window in whole seconds.
+    pub window_secs: u64,
+    /// Generic action executed for this watch's logical firing.
+    #[serde(deserialize_with = "deserialize_validated_action")]
+    pub action: RiteAction,
+}
+
+impl RiteWatch {
+    /// Convert this watch's matcher into Rite's existing condition tree.
+    pub fn condition_tree(&self) -> Result<MatchCondition> {
+        RiteHandler::tree_from_map(&self.matcher)
+    }
+
+    /// Whether an admitted event is an external heartbeat for this watch.
+    #[must_use]
+    pub fn matches(&self, event: &RiteEvent) -> bool {
+        self.watch_source
+            .iter()
+            .any(|source| source == &event.source)
+            && self
+                .condition_tree()
+                .is_ok_and(|condition| condition.matches(event))
+    }
+}
+
 /// Deserialize a handler's match table, rejecting malformed compound forms.
 ///
 /// This makes the load-time rejection guarantee structural: no code path
@@ -599,7 +635,8 @@ pub enum JsonTemplateError {
     MissingData,
 }
 
-fn validate_action(action: &RiteAction) -> std::result::Result<(), String> {
+/// Validate a programmatically constructed action before it is executed.
+pub fn validate_action(action: &RiteAction) -> std::result::Result<(), String> {
     match action {
         RiteAction::HttpPost {
             headers,

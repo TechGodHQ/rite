@@ -1,20 +1,24 @@
 //! HTTP service for Rite.
 
 pub mod dispatch;
+mod watch_runtime;
+use watch_runtime::{ActionDispatchGate, ActionDispatchPermit, WatchService};
 
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
 
 use axum::{Router, routing::get};
+use rite_core::watch::MIN_WATCH_WINDOW_SECS;
 use rite_core::{
     ACTION_VALIDATION_ERROR_PREFIX, EventSource, MATCH_VALIDATION_ERROR_PREFIX, RiteAction,
-    RiteEvent, RiteHandler,
+    RiteEvent, RiteHandler, RiteWatch,
 };
 use rite_sources::{github::GitHubSource, iris::IrisSource, uptime_kuma::UptimeKumaSource};
 use serde::Deserialize;
@@ -42,8 +46,20 @@ pub struct Diagnostic {
 pub struct RiteConfig {
     #[serde(default)]
     pub rites: Vec<RiteHandler>,
+    /// Internal dead-man watches; omitted from legacy configurations.
+    #[serde(default)]
+    pub watches: Vec<RiteWatch>,
+    /// Explicit durable state location, required only when watches exist.
+    pub watch_state: Option<WatchStateConfig>,
     #[serde(default)]
     pub sources: SourcesConfig,
+}
+
+/// Explicit path for durable dead-man watch state.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatchStateConfig {
+    /// Versioned state file path, relative to the process working directory when not absolute.
+    pub path: PathBuf,
 }
 
 /// Source configuration loaded from TOML.
@@ -91,6 +107,11 @@ pub struct Metrics {
     pub actions_succeeded: AtomicU64,
     pub actions_failed: AtomicU64,
     started_at: Instant,
+    watch_configs: Vec<RiteWatch>,
+    watch_state_path: Option<PathBuf>,
+    watch_service: OnceLock<Arc<WatchService>>,
+    watch_supervisor_active: AtomicBool,
+    action_dispatch_gate: Arc<ActionDispatchGate>,
 }
 
 impl Default for Metrics {
@@ -101,6 +122,45 @@ impl Default for Metrics {
             actions_succeeded: AtomicU64::new(0),
             actions_failed: AtomicU64::new(0),
             started_at: Instant::now(),
+            watch_configs: Vec::new(),
+            watch_state_path: None,
+            watch_service: OnceLock::new(),
+            watch_supervisor_active: AtomicBool::new(false),
+            action_dispatch_gate: Arc::new(ActionDispatchGate::default()),
+        }
+    }
+}
+
+impl Metrics {
+    fn watch_runtime_is_supervised(&self) -> bool {
+        self.watch_configs.is_empty()
+            || (self.watch_supervisor_active.load(Ordering::Acquire)
+                && !self.action_dispatch_gate.is_closed()
+                && self
+                    .watch_service
+                    .get()
+                    .is_some_and(|service| !service.is_fatal()))
+    }
+
+    fn authorize_action_dispatch(&self) -> Option<ActionDispatchPermit> {
+        self.watch_runtime_is_supervised()
+            .then(|| self.action_dispatch_gate.try_acquire())
+            .flatten()
+    }
+}
+
+struct WatchSupervisorGuard {
+    metrics: Arc<Metrics>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for WatchSupervisorGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .watch_supervisor_active
+            .store(false, Ordering::Release);
+        for task in &self.tasks {
+            task.abort();
         }
     }
 }
@@ -114,10 +174,36 @@ impl Default for Metrics {
 /// through [`dispatch::execute_raw_operation_http`] so HMAC verification
 /// sees the exact wire bytes and headers.
 pub fn app(state: AppState) -> Router {
+    if !state.metrics.watch_runtime_is_supervised() {
+        return Router::new().fallback(watch_runtime_unavailable);
+    }
     Router::new()
         .route("/health", get(health))
         .merge(dispatch::generated::generated_router())
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state.metrics),
+            enforce_watch_runtime,
+        ))
         .with_state(state)
+}
+
+async fn enforce_watch_runtime(
+    axum::extract::State(metrics): axum::extract::State<Arc<Metrics>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if metrics.watch_runtime_is_supervised() {
+        next.run(request).await
+    } else {
+        watch_runtime_unavailable().await
+    }
+}
+
+async fn watch_runtime_unavailable() -> axum::response::Response {
+    axum::response::IntoResponse::into_response((
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "configured watches require supervised serving",
+    ))
 }
 
 /// A configuration-load failure safe to display in CLI output and logs.
@@ -211,6 +297,35 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
         });
     }
 
+    diagnostics.extend(validate_handler_config(config, &configured_sources));
+
+    let enabled_sources = [
+        Some("github"),
+        config
+            .sources
+            .iris
+            .as_ref()
+            .filter(|source| source.enabled)
+            .map(|_| "iris"),
+        config
+            .sources
+            .uptime_kuma
+            .as_ref()
+            .filter(|source| source.enabled)
+            .map(|_| "uptime_kuma"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<std::collections::BTreeSet<_>>();
+    diagnostics.extend(validate_watch_config(config, &enabled_sources));
+    diagnostics
+}
+
+fn validate_handler_config(
+    config: &RiteConfig,
+    configured_sources: &std::collections::BTreeSet<&str>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
     let mut names = std::collections::BTreeSet::new();
     for handler in &config.rites {
         if let Err(error) = handler.condition_tree() {
@@ -220,6 +335,12 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
                     "handler '{}' has an invalid match table: {error}",
                     handler.name
                 ),
+            });
+        }
+        if rite_core::validate_action(&handler.action).is_err() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("handler '{}' has an invalid action", handler.name),
             });
         }
         if !configured_sources.contains(handler.source.as_str()) {
@@ -237,6 +358,104 @@ pub fn validate(config: &RiteConfig) -> Vec<Diagnostic> {
                 message: format!("duplicate handler name '{}'", handler.name),
             });
         }
+    }
+    diagnostics
+}
+
+fn validate_watch_config(
+    config: &RiteConfig,
+    configured_sources: &std::collections::BTreeSet<&str>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut watch_names = std::collections::BTreeSet::new();
+    for watch in &config.watches {
+        if watch.name.trim().is_empty() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: "watch name must not be empty".into(),
+            });
+        }
+        if !watch_names.insert(watch.name.as_str()) {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("duplicate watch name '{}'", watch.name),
+            });
+        }
+        if watch.condition_tree().is_err() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("watch '{}' matcher is malformed", watch.name),
+            });
+        }
+        if rite_core::validate_action(&watch.action).is_err() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("watch '{}' has an invalid action", watch.name),
+            });
+        }
+        if watch.window_secs < MIN_WATCH_WINDOW_SECS {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!(
+                    "watch '{}' window_secs must be at least {MIN_WATCH_WINDOW_SECS}",
+                    watch.name
+                ),
+            });
+        }
+        if watch
+            .window_secs
+            .checked_mul(1_000)
+            .is_none_or(|millis| i64::try_from(millis).is_err())
+        {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!(
+                    "watch '{}' window_secs exceeds the supported durable time range",
+                    watch.name
+                ),
+            });
+        }
+        if watch.watch_source.is_empty() {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: format!("watch '{}' must name at least one watch_source", watch.name),
+            });
+        }
+        let mut watch_sources = std::collections::BTreeSet::new();
+        for source in &watch.watch_source {
+            if source.trim().is_empty() {
+                diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("watch '{}' has an empty watch_source", watch.name),
+                });
+            }
+            if !watch_sources.insert(source.as_str()) {
+                diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("watch '{}' repeats watch_source '{}'", watch.name, source),
+                });
+            }
+            if !configured_sources.contains(source.as_str()) {
+                diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!(
+                        "watch '{}' references unknown or disabled source '{}'",
+                        watch.name, source
+                    ),
+                });
+            }
+        }
+    }
+    if !config.watches.is_empty()
+        && config
+            .watch_state
+            .as_ref()
+            .is_none_or(|state| state.path.as_os_str().is_empty())
+    {
+        diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            message: "configured watches require an explicit watch_state.path".into(),
+        });
     }
     diagnostics
 }
@@ -287,6 +506,20 @@ pub(crate) fn status_snapshot(state: &AppState) -> serde_json::Value {
 
 /// Builds state with a GitHub source and TOML-configured handlers.
 pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<AppState> {
+    if validate(&config)
+        .iter()
+        .any(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+    {
+        return Err(rite_core::RiteError::Config(
+            "Rite configuration failed validation".to_owned(),
+        ));
+    }
+    let mut metrics = Metrics::default();
+    metrics.watch_configs.clone_from(&config.watches);
+    metrics.watch_state_path = config
+        .watch_state
+        .as_ref()
+        .map(|watch_state| watch_state.path.clone());
     let iris = config
         .sources
         .iris
@@ -306,8 +539,65 @@ pub fn configured_state(secret: &str, config: RiteConfig) -> rite_core::Result<A
         sources: Arc::new(sources),
         client: reqwest::Client::new(),
         iris,
-        metrics: Arc::new(Metrics::default()),
+        metrics: Arc::new(metrics),
     })
+}
+
+/// Initialize serving-only durable watch state before opening the listener.
+///
+/// Read-only generated CLI operations call `configured_state` but never this
+/// function, so reading configuration cannot lock, create or re-arm state.
+pub fn initialize_watch_service(state: &mut AppState) -> Result<(), String> {
+    let config = watch_runtime::RiteConfigView {
+        watches: &state.metrics.watch_configs,
+        state_path: state.metrics.watch_state_path.as_ref(),
+    };
+    if let Some(service) =
+        WatchService::open(&config, Arc::clone(&state.metrics.action_dispatch_gate))
+            .map_err(|error| error.to_string())?
+        && state.metrics.watch_service.set(service).is_err()
+    {
+        return Err("watch coordinator already initialized".to_owned());
+    }
+    Ok(())
+}
+
+/// Serve HTTP while supervising the coordinator as a process-critical task.
+pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> Result<(), String> {
+    if !state.metrics.watch_configs.is_empty() && state.metrics.watch_service.get().is_none() {
+        return Err("configured watches require an initialized watch coordinator".to_owned());
+    }
+    if !state.metrics.watch_configs.is_empty()
+        && state
+            .metrics
+            .watch_supervisor_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return Err("configured watches already have an active supervisor".to_owned());
+    }
+    let mut supervisor = WatchSupervisorGuard {
+        metrics: Arc::clone(&state.metrics),
+        tasks: Vec::new(),
+    };
+    supervisor.tasks = start_iris_subscription_tasks(&state);
+    let watch_service = state.metrics.watch_service.get().cloned();
+    let server = axum::serve(listener, app(state));
+    if let Some(service) = watch_service {
+        let runner = Arc::clone(&service);
+        tokio::select! {
+            result = server => result.map_err(|_| "Rite HTTP serving failed".to_owned()),
+            result = runner.run() => match result {
+                Ok(()) => Err("watch coordinator stopped unexpectedly".to_owned()),
+                Err(error) => Err(error.to_string()),
+            },
+            () = service.fatal() => Err("watch admission failed; stopping Rite".to_owned()),
+        }
+    } else {
+        server
+            .await
+            .map_err(|_| "Rite HTTP serving failed".to_owned())
+    }
 }
 
 /// Builds the generic HTTP action request shared by webhook and subscription dispatch.
@@ -355,28 +645,87 @@ pub(crate) fn http_post_request(
     }
 }
 
-/// Starts the configured Iris subscription without preventing the HTTP server from starting.
+/// Starts an Iris subscription for configurations without watches.
+///
+/// Configured watches require [`serve`], which owns and supervises the source tasks.
 pub fn start_iris_subscription(state: &AppState) {
-    let Some(iris) = state.iris.clone() else {
+    if !state.metrics.watch_configs.is_empty() {
+        tracing::error!("configured watches require serve() to supervise Iris subscription");
         return;
+    }
+    drop(start_iris_subscription_tasks(state));
+}
+
+fn start_iris_subscription_tasks(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
+    if !state.metrics.watch_runtime_is_supervised() {
+        tracing::error!("configured watches require supervised serving before Iris subscription");
+        return Vec::new();
+    }
+    let Some(iris) = state.iris.clone() else {
+        return Vec::new();
     };
     let handlers = Arc::clone(&state.handlers);
     let client = state.client.clone();
     let metrics = Arc::clone(&state.metrics);
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(iris.subscribe(sender));
+    let watch_service = state.metrics.watch_service.get().cloned();
+    let (sender, receiver) = tokio::sync::mpsc::channel(64);
+    let (action_sender, action_receiver) = tokio::sync::mpsc::channel(64);
+    let action_metrics = Arc::clone(&metrics);
+    let source_task = tokio::spawn(iris.subscribe(sender));
+    let ingress_task = spawn_iris_ingress_task(metrics, watch_service, receiver, action_sender);
+    let action_task = spawn_iris_action_task(action_metrics, handlers, client, action_receiver);
+    vec![source_task, ingress_task, action_task]
+}
+
+fn spawn_iris_ingress_task(
+    metrics: Arc<Metrics>,
+    watch_service: Option<Arc<WatchService>>,
+    mut receiver: tokio::sync::mpsc::Receiver<RiteEvent>,
+    action_sender: tokio::sync::mpsc::Sender<RiteEvent>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {
+            if !metrics.watch_runtime_is_supervised() {
+                break;
+            }
+            if let Some(watches) = &watch_service
+                && watches.observe(&event).is_err()
+            {
+                break;
+            }
             metrics.events_received.fetch_add(1, Ordering::Relaxed);
+            if action_sender.send(event).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_iris_action_task(
+    action_metrics: Arc<Metrics>,
+    handlers: Arc<Vec<RiteHandler>>,
+    client: reqwest::Client,
+    mut action_receiver: tokio::sync::mpsc::Receiver<RiteEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = action_receiver.recv().await {
+            if !action_metrics.watch_runtime_is_supervised() {
+                break;
+            }
             tracing::info!(source = %event.source, event_type = %event.event_type, action = ?event.action, "Iris event received");
             let matched = handlers
                 .iter()
                 .filter(|handler| handler.matches(&event))
                 .collect::<Vec<_>>();
             if !matched.is_empty() {
-                metrics.events_matched.fetch_add(1, Ordering::Relaxed);
+                action_metrics
+                    .events_matched
+                    .fetch_add(1, Ordering::Relaxed);
             }
             for handler in matched {
+                if !action_metrics.watch_runtime_is_supervised() {
+                    break;
+                }
                 tracing::info!(handler = %handler.name, "Iris event matched handler");
                 let RiteAction::HttpPost {
                     url,
@@ -392,32 +741,46 @@ pub fn start_iris_subscription(state: &AppState) {
                     body_json.as_ref(),
                     &event,
                 ) {
-                    Ok(request) => match request.send().await {
-                        Ok(response) if response.status().is_success() => {
-                            metrics.actions_succeeded.fetch_add(1, Ordering::Relaxed);
-                            tracing::info!(handler = %handler.name, "Iris event action completed");
+                    Ok(request) => {
+                        let Some(_permit) = action_metrics.authorize_action_dispatch() else {
+                            break;
+                        };
+                        match request.send().await {
+                            Ok(response) if response.status().is_success() => {
+                                action_metrics
+                                    .actions_succeeded
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::info!(handler = %handler.name, "Iris event action completed");
+                            }
+                            Ok(response) => {
+                                action_metrics
+                                    .actions_failed
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(handler = %handler.name, status = %response.status(), "Iris event action returned failure status");
+                            }
+                            Err(_error) => {
+                                action_metrics
+                                    .actions_failed
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(handler = %handler.name, "Iris event action request failed");
+                            }
                         }
-                        Ok(response) => {
-                            metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(handler = %handler.name, status = %response.status(), "Iris event action returned failure status");
-                        }
-                        Err(_error) => {
-                            metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(handler = %handler.name, "Iris event action request failed");
-                        }
-                    },
+                    }
                     Err(error) => {
-                        metrics.actions_failed.fetch_add(1, Ordering::Relaxed);
+                        action_metrics
+                            .actions_failed
+                            .fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(handler = %handler.name, error = %error, "Iris event action request could not be built");
                     }
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use axum::{
         body::{Body, to_bytes},
         extract::State,
@@ -433,6 +796,55 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    struct GatedEventSource {
+        metadata: rite_core::SourceMetadata,
+        entered: mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        parse_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EventSource for GatedEventSource {
+        fn metadata(&self) -> &rite_core::SourceMetadata {
+            &self.metadata
+        }
+
+        async fn verify(
+            &self,
+            _headers: &[(String, String)],
+            _body: &[u8],
+        ) -> rite_core::Result<()> {
+            let _ = self.entered.send(());
+            self.release
+                .lock()
+                .await
+                .take()
+                .expect("test verification gate exists")
+                .await
+                .expect("test verification gate releases");
+            Ok(())
+        }
+
+        async fn parse(
+            &self,
+            _headers: &[(String, String)],
+            _body: &[u8],
+        ) -> rite_core::Result<RiteEvent> {
+            self.parse_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(RiteEvent {
+                source: "github".into(),
+                event_type: "push".into(),
+                action: None,
+                timestamp: chrono::DateTime::from_timestamp_millis(1).unwrap(),
+                severity: rite_core::Severity::Info,
+                title: "gated source event".into(),
+                body: None,
+                metadata: BTreeMap::new(),
+            })
+        }
+    }
 
     fn signature(secret: &str, body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("valid key");
@@ -792,6 +1204,367 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn hold_action_until_released(
+        State((notifications, release)): State<(
+            mpsc::UnboundedSender<()>,
+            tokio::sync::watch::Receiver<bool>,
+        )>,
+    ) -> StatusCode {
+        notifications
+            .send(())
+            .expect("action test receiver is open");
+        let mut release = release;
+        while !*release.borrow() {
+            if release.changed().await.is_err() {
+                break;
+            }
+        }
+        StatusCode::NO_CONTENT
+    }
+
+    fn watch_ingress_config(action_url: &str, state_path: PathBuf) -> RiteConfig {
+        let action = RiteAction::HttpPost {
+            url: url::Url::parse(action_url).unwrap(),
+            headers: BTreeMap::new(),
+            body_template: None,
+            body_json: None,
+        };
+        let matcher = BTreeMap::from([(
+            "event_type".to_owned(),
+            rite_core::MatchValue::String("push".to_owned()),
+        )]);
+        RiteConfig {
+            rites: vec![RiteHandler {
+                name: "slow-handler".into(),
+                source: "github".into(),
+                matcher: matcher.clone(),
+                action: action.clone(),
+            }],
+            watches: vec![RiteWatch {
+                name: "ingress-watch".into(),
+                watch_source: vec!["github".into()],
+                matcher,
+                window_secs: 60,
+                action,
+            }],
+            watch_state: Some(WatchStateConfig { path: state_path }),
+            sources: SourcesConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_configured_watches_without_prebind_initialization() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-uninitialized-{}.json",
+            std::process::id()
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path.clone()),
+        )
+        .unwrap();
+
+        let result = timeout(Duration::from_millis(100), serve(listener, state)).await;
+        assert!(matches!(
+            result,
+            Ok(Err(message)) if message.contains("watch coordinator")
+        ));
+        assert!(!state_path.exists());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn public_app_refuses_configured_watches_without_supervision() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-app-unsupervised-{}.json",
+            std::process::id()
+        ));
+        let state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path),
+        )
+        .unwrap();
+        let response = app(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn raw_event_dispatch_refuses_configured_watches_without_supervision() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-dispatch-unsupervised-{}.json",
+            std::process::id()
+        ));
+        let state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path),
+        )
+        .unwrap();
+        let response = dispatch::execute_raw_operation_http(
+            &state,
+            "receive_event",
+            dispatch::generated::GeneratedRawOperationInput {
+                path: std::collections::BTreeMap::from([("source".into(), "github".into())]),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn fatal_admission_rejects_already_admitted_and_future_webhooks() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-fatal-admission-{}.json",
+            std::process::id()
+        ));
+        let mut state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path.clone()),
+        )
+        .unwrap();
+        initialize_watch_service(&mut state).unwrap();
+        state
+            .metrics
+            .watch_supervisor_active
+            .store(true, Ordering::Release);
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let source = Arc::new(GatedEventSource {
+            metadata: rite_core::SourceMetadata {
+                id: "github",
+                name: "gated synthetic source",
+                capabilities: &[],
+            },
+            entered: entered_tx,
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+            parse_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let source_for_state: Arc<dyn EventSource> = source.clone();
+        state.sources = Arc::new(BTreeMap::from([("github".to_owned(), source_for_state)]));
+        let router = app(state.clone());
+        let request_state = state.clone();
+        let request = tokio::spawn(async move {
+            dispatch::execute_raw_operation_http(
+                &request_state,
+                "receive_event",
+                dispatch::generated::GeneratedRawOperationInput {
+                    path: BTreeMap::from([("source".into(), "github".into())]),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        entered_rx
+            .recv()
+            .await
+            .expect("request passes the initial dispatch gate");
+        state.metrics.watch_service.get().unwrap().signal_fatal();
+        release_tx.send(()).expect("verification gate releases");
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            source
+                .parse_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "fatal state is checked again after asynchronous source verification"
+        );
+        let response = dispatch::execute_raw_operation_http(
+            &state,
+            "receive_event",
+            dispatch::generated::GeneratedRawOperationInput {
+                path: BTreeMap::from([("source".into(), "github".into())]),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = router
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(state);
+        std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_file(format!("{}.lock", state_path.display())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_watch_supervisor_clears_shared_readiness() {
+        let state_path = std::env::temp_dir().join(format!(
+            "rite-watch-supervisor-cancel-{}.json",
+            std::process::id()
+        ));
+        let mut state = configured_state(
+            "synthetic-secret",
+            watch_ingress_config("http://127.0.0.1:9/action", state_path.clone()),
+        )
+        .unwrap();
+        initialize_watch_service(&mut state).unwrap();
+        let retained = state.clone();
+        let metrics = Arc::clone(&state.metrics);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving = tokio::spawn(serve(listener, state));
+        timeout(Duration::from_secs(1), async {
+            while !metrics.watch_supervisor_active.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supervisor starts");
+
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+        assert!(!metrics.watch_supervisor_active.load(Ordering::Acquire));
+        let response = app(retained.clone())
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = dispatch::execute_raw_operation_http(
+            &retained,
+            "receive_event",
+            dispatch::generated::GeneratedRawOperationInput {
+                path: std::collections::BTreeMap::from([("source".into(), "github".into())]),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(retained);
+        drop(metrics);
+        std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_file(format!("{}.lock", state_path.display())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_guard_aborts_owned_subscription_tasks() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        let guard = WatchSupervisorGuard {
+            metrics: Arc::new(Metrics::default()),
+            tasks: vec![task],
+        };
+        drop(guard);
+
+        timeout(Duration::from_secs(1), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription task aborts with its supervisor");
+    }
+
+    fn signed_github_push(secret: &str, body: &[u8]) -> Request<Body> {
+        Request::post("/event/github")
+            .header("X-GitHub-Event", "push")
+            .header("X-Hub-Signature-256", signature(secret, body))
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_webhook_persists_heartbeat_while_prior_action_is_blocked() {
+        use std::os::unix::fs::MetadataExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let action_url = format!("http://{}/action", listener.local_addr().unwrap());
+        let (notifications_tx, mut notifications_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let receiver = Router::new()
+            .route("/action", post(hold_action_until_released))
+            .with_state((notifications_tx, release_rx));
+        let receiver_task = tokio::spawn(async move {
+            axum::serve(listener, receiver).await.unwrap();
+        });
+
+        let state_path =
+            std::env::temp_dir().join(format!("rite-watch-ingress-{}.json", std::process::id()));
+        let mut state = configured_state(
+            "synthetic-webhook-secret",
+            watch_ingress_config(&action_url, state_path.clone()),
+        )
+        .unwrap();
+        initialize_watch_service(&mut state).unwrap();
+        state
+            .metrics
+            .watch_supervisor_active
+            .store(true, Ordering::Release);
+        let webhook = app(state);
+        let body = br#"{"ref":"refs/heads/main","repository":{"name":"rite"}}"#;
+
+        let first = tokio::spawn({
+            let webhook = webhook.clone();
+            let request = signed_github_push("synthetic-webhook-secret", body);
+            async move { webhook.oneshot(request).await.unwrap() }
+        });
+        notifications_rx.recv().await.unwrap();
+        let first_inode = std::fs::metadata(&state_path).unwrap().ino();
+        assert!(
+            std::fs::read_to_string(&state_path)
+                .unwrap()
+                .contains("last_seen_utc_ms")
+        );
+
+        let invalid_app = webhook.clone();
+        let second_request = signed_github_push("synthetic-webhook-secret", body);
+        let second = tokio::spawn(async move { webhook.oneshot(second_request).await.unwrap() });
+        notifications_rx.recv().await.unwrap();
+        let second_inode = std::fs::metadata(&state_path).unwrap().ino();
+        assert_ne!(
+            first_inode, second_inode,
+            "second admission was durably replaced"
+        );
+        let saved = std::fs::read_to_string(&state_path).unwrap();
+        assert!(!saved.contains("refs/heads/main"));
+        assert!(!saved.contains("synthetic-webhook-secret"));
+
+        let invalid_body = br#"{"ref":"refs/heads/invalid","repository":{"name":"rite"}}"#;
+        let before_invalid = std::fs::metadata(&state_path).unwrap().ino();
+        let invalid = invalid_app
+            .oneshot(
+                Request::post("/event/github")
+                    .header("X-GitHub-Event", "push")
+                    .header(
+                        "X-Hub-Signature-256",
+                        signature("wrong-secret", invalid_body),
+                    )
+                    .body(Body::from(invalid_body.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().ino(),
+            before_invalid,
+            "untrusted webhook input must not be admitted as a heartbeat"
+        );
+
+        release_tx.send(true).unwrap();
+        assert_eq!(first.await.unwrap().status(), StatusCode::ACCEPTED);
+        assert_eq!(second.await.unwrap().status(), StatusCode::ACCEPTED);
+        receiver_task.abort();
+        let _ = receiver_task.await;
+        let lock_path = state_path.with_file_name(format!(
+            "{}.lock",
+            state_path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::remove_file(state_path).unwrap();
+        std::fs::remove_file(lock_path).unwrap();
     }
 
     #[tokio::test]
@@ -1200,8 +1973,24 @@ action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CO
         assert_eq!(get, listed[0]);
     }
 
-    #[tokio::test]
-    async fn configured_iris_dispatch_selects_literal_provenance_and_rejects_false_positives() {
+    async fn assert_iris_watch_admissions(state: &AppState, path: &std::path::Path, expected: u64) {
+        timeout(Duration::from_secs(2), async {
+            while state.metrics.events_received.load(Ordering::Relaxed) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all SSE events pass through watch admission");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("watch state is durable"))
+                .expect("watch state remains valid JSON");
+        assert!(saved["watches"]["iris-watch"]["last_seen_utc_ms"].is_i64());
+        let saved = saved.to_string();
+        assert!(!saved.contains("turn_ended"));
+        assert!(!saved.contains("occurrence_id"));
+    }
+
+    fn iris_fixture_messages() -> (Vec<serde_json::Value>, Vec<String>) {
         let fixtures: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/inbox-notifications/v1/fixtures.json"
         ))
@@ -1227,8 +2016,16 @@ action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CO
             }
         }
         assert_eq!(expected_records.len(), 5, "fixture selection baseline");
+        (messages, expected_records)
+    }
 
+    #[tokio::test]
+    async fn configured_iris_dispatch_selects_literal_provenance_and_rejects_false_positives() {
+        let (messages, expected_records) = iris_fixture_messages();
         let (action_url, mut captured, shutdown) = receiver().await;
+        let watch_state_path =
+            std::env::temp_dir().join(format!("rite-iris-watch-{}.json", std::process::id()));
+        let incoming_event_count = u64::try_from(messages.len()).unwrap();
         let iris_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Iris listener binds");
@@ -1261,9 +2058,21 @@ action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CO
  "#
         .replace("__IRIS_URL__", &format!("http://{iris_address}"))
         .replace("__ACTION_URL__", &action_url);
+        let config_text = format!(
+            "{config_text}\n[watch_state]\npath = {:?}\n\n[[watches]]\nname = \"iris-watch\"\nwatch_source = [\"iris\"]\nmatch = {{ event_type = \"text\" }}\nwindow_secs = 60\naction = {{ type = \"http_post\", url = \"{action_url}\" }}\n",
+            watch_state_path.to_string_lossy()
+        );
         let config = load_config(&config_text).expect("path predicate config parses");
-        let state = configured_state("secret", config).expect("state configures");
-        start_iris_subscription(&state);
+        let mut state = configured_state("secret", config).expect("state configures");
+        initialize_watch_service(&mut state).expect("Iris watch state initializes");
+        state
+            .metrics
+            .watch_supervisor_active
+            .store(true, Ordering::Release);
+        let subscription_guard = WatchSupervisorGuard {
+            metrics: Arc::clone(&state.metrics),
+            tasks: start_iris_subscription_tasks(&state),
+        };
 
         let mut observed_records = Vec::new();
         for _ in 0..expected_records.len() {
@@ -1282,6 +2091,7 @@ action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CO
             ));
         }
         assert_eq!(observed_records, expected_records);
+        assert_iris_watch_admissions(&state, &watch_state_path, incoming_event_count).await;
         assert!(
             timeout(Duration::from_millis(100), captured.recv())
                 .await
@@ -1296,6 +2106,13 @@ action = { type = "http_post", url = "https://example.test/hook?token=PRIVATE_CO
             expected_records.len() as u64
         );
         shutdown.send(()).expect("action receiver shuts down");
+        drop(subscription_guard);
+        let lock_path = watch_state_path.with_file_name(format!(
+            "{}.lock",
+            watch_state_path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::remove_file(watch_state_path).unwrap();
+        std::fs::remove_file(lock_path).unwrap();
     }
 
     #[test]
@@ -1456,5 +2273,192 @@ action = { type = "http_post", url = "https://example.test/hook" }
                 "{label} error must name the match table: {err}"
             );
         }
+    }
+
+    #[test]
+    fn watch_configuration_rejects_short_windows_and_requires_explicit_state_path() {
+        let config = load_config(
+            r#"[[watches]]
+name = "too-short"
+watch_source = ["github"]
+match = { event_type = "push" }
+window_secs = 3
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .expect("watch configuration is syntactically valid");
+
+        let errors = validate(&config)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            errors.iter().any(|message| message.contains("window_secs")),
+            "a sub-four-second window must fail validation: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("watch_state.path")),
+            "enabled watches require an explicit durable state path: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn watch_configuration_rejects_duplicate_names_and_unknown_sources() {
+        let config = load_config(
+            r#"[watch_state]
+path = "state.json"
+
+[[watches]]
+name = "duplicate"
+watch_source = ["missing"]
+match = { event_type = "push" }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+
+[[watches]]
+name = "duplicate"
+watch_source = ["github"]
+match = { event_type = "push" }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .expect("watch configuration is syntactically valid");
+
+        let errors = validate(&config)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("duplicate watch")),
+            "watch names are unique: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("unknown or disabled source")),
+            "watch sources must be available: {errors:?}"
+        );
+
+        let disabled_source = load_config(
+            r#"[watch_state]
+path = "state.json"
+
+[sources.iris]
+enabled = false
+base_url = "http://127.0.0.1:3000"
+
+[[watches]]
+name = "disabled-iris"
+watch_source = ["iris"]
+match = { event_type = "text" }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .expect("disabled-source watch configuration parses");
+        let disabled_errors = validate(&disabled_source)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(disabled_errors.iter().any(|message| {
+            message.contains("unknown or disabled source") && message.contains("iris")
+        }));
+    }
+
+    #[test]
+    fn direct_watch_config_rejects_a_malformed_matcher() {
+        let mut config = load_config(
+            r#"[watch_state]
+path = "state.json"
+
+[[watches]]
+name = "malformed"
+watch_source = ["github"]
+match = { event_type = "push" }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .unwrap();
+        config.watches[0].matcher = std::collections::BTreeMap::from([(
+            "any_of".into(),
+            rite_core::MatchValue::Array(Vec::new()),
+        )]);
+
+        let errors = validate(&config)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            errors.iter().any(|message| message.contains("matcher")),
+            "programmatically supplied matchers must be validated: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn direct_watch_config_rejects_an_invalid_action() {
+        let mut config = load_config(
+            r#"[watch_state]
+path = "state.json"
+
+[[watches]]
+name = "malformed-action"
+watch_source = ["github"]
+match = { event_type = "push" }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .unwrap();
+        config.watches[0].action = RiteAction::HttpPost {
+            url: url::Url::parse("https://example.test/watch").unwrap(),
+            headers: BTreeMap::new(),
+            body_template: Some("{{event_type}}".into()),
+            body_json: Some(serde_json::json!({"event":"{{event_type}}"})),
+        };
+
+        let errors = validate(&config)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            errors.iter().any(|message| message.contains("action")),
+            "programmatically supplied actions must be validated: {errors:?}"
+        );
+        assert!(
+            configured_state("synthetic-secret", config).is_err(),
+            "configured_state must not serve a programmatically invalid action"
+        );
+    }
+
+    #[test]
+    fn watch_configuration_rejects_malformed_compound_matchers_at_load() {
+        let error = load_config(
+            r#"[watch_state]
+path = "state.json"
+
+[[watches]]
+name = "malformed"
+watch_source = ["github"]
+match = { any_of = [] }
+window_secs = 60
+action = { type = "http_post", url = "https://example.test/watch" }
+"#,
+        )
+        .expect_err("empty any_of watcher matchers must be rejected while loading");
+        assert!(
+            error.to_string().contains("match"),
+            "matcher errors must remain value-free and actionable: {error}"
+        );
     }
 }

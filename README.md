@@ -196,6 +196,64 @@ scalar under an operator-named key (for example, `not = "draft"`) remains an
 ordinary metadata lookup exactly as before, so existing scalar configurations
 never change meaning.
 
+## Dead-man watches
+
+`[[watches]]` arms an internal dead-man switch when Rite starts and re-arms it
+whenever an authenticated GitHub/Uptime Kuma webhook or admitted Iris event
+matches both `watch_source` and `match`. A deadline creates one internal
+`monitor:deadline_exceeded` firing for that watch's configured generic action;
+it is not sent through ordinary handlers or back through event admission.
+Overdue windows coalesce, and a heartbeat never cancels a firing already
+committed for delivery.
+
+Watches require an explicit durable state path and windows of at least four
+seconds (the evaluator ticks once per second):
+
+```toml
+[watch_state]
+path = "./rite-watch-state.json"
+
+[[watches]]
+name = "builder-heartbeat"
+watch_source = ["iris"]
+match = { all_of = [{ event_type = "text" }, { body_contains = "builder-01 heartbeat" }] }
+window_secs = 60
+action = { type = "http_post", url = "https://hooks.example.test/dead-man" }
+
+[sources.iris]
+enabled = true
+base_url = "http://127.0.0.1:3000"
+```
+
+State is versioned, written with private file permissions, atomically replaced
+and synced, and protected by a process-lifetime exclusive lock. A second Rite
+serve process using the same state path fails closed. Generated read-only CLI
+operations do not create or initialize watch state. Required state failures
+stop the whole Rite process; they are not warnings while serving continues.
+
+Deadlines are saved as absolute UTC Unix-millisecond boundaries and a durable
+nondecreasing high-water mark. On recovery, Rite requires a representable host
+UTC sample at least as large as that mark, then maps saved boundaries once into
+the new process's monotonic epoch. During that epoch all new logical times come
+from the paired host/monotonic sample, not from later wall-clock reads. This
+assumes the host UTC clock reflects elapsed time across shutdowns and reboots;
+Rite cannot detect every hidden forward step or cross-boot clock manipulation.
+If valid saved obligations cannot be compared to host time, startup fails before
+the listener binds and the saved bytes/deadlines are left untouched.
+
+Each logical firing retains one event identity and at most three durably
+reserved HTTP attempts. Each request is bounded to ten seconds; an observed
+unacknowledged result waits five seconds after attempt one or thirty seconds
+after attempt two. A crash during an attempt resumes only after its saved
+reservation time plus the ten-second bound and that ordinal's delay. HTTP 2xx
+is considered accepted only after that outcome is durably recorded. An
+uncertain attempt may have reached its receiver, so retrying can cause
+duplicates; a later success retains that uncertainty. No exactly-once or
+eventual-delivery guarantee is implied.
+The pending record keeps the synthetic event and a SHA-256 action-configuration
+fingerprint, not the source heartbeat body or credential values. A changed
+action cannot silently redirect an already-pending firing after restart.
+
 ## Development
 
 ```bash
