@@ -109,7 +109,7 @@ pub(crate) struct WatchService {
 struct WatchState {
     store: DurableStore,
     configs: BTreeMap<String, RiteWatch>,
-    live_attempts: BTreeSet<String>,
+    live_attempts: BTreeSet<(String, u8)>,
 }
 
 struct DurableStore {
@@ -124,6 +124,16 @@ struct ReservedAction {
     watch_name: String,
     firing: FiringRecord,
     action: RiteAction,
+}
+
+struct LiveAttemptCleanup(Arc<WatchService>);
+
+impl Drop for LiveAttemptCleanup {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.live_attempts.clear();
+        }
+    }
 }
 
 /// Read-only config view used by pre-bind serving initialization.
@@ -363,11 +373,9 @@ impl WatchService {
                 .watches
                 .get_mut(name)
                 .ok_or(RuntimeError::InvalidState)?;
-            if record
-                .pending
-                .as_ref()
-                .is_some_and(|pending| live_attempts.contains(&pending.id))
-            {
+            if record.pending.as_ref().is_some_and(|pending| {
+                live_attempts.contains(&(pending.id.clone(), pending.attempts_reserved))
+            }) {
                 continue;
             }
             if record
@@ -399,11 +407,9 @@ impl WatchService {
                 .watches
                 .get_mut(&name)
                 .ok_or(RuntimeError::InvalidState)?;
-            if record
-                .pending
-                .as_ref()
-                .is_some_and(|pending| live_attempts.contains(&pending.id))
-            {
+            if record.pending.as_ref().is_some_and(|pending| {
+                live_attempts.contains(&(pending.id.clone(), pending.attempts_reserved))
+            }) {
                 continue;
             }
             if let Some(firing) = record
@@ -428,7 +434,10 @@ impl WatchService {
             state.store.persist()?;
         }
         if let Some(reserved) = &reserved {
-            state.live_attempts.insert(reserved.firing.id.clone());
+            state.live_attempts.insert((
+                reserved.firing.id.clone(),
+                reserved.firing.attempts_reserved,
+            ));
         }
         Ok(reserved)
     }
@@ -437,6 +446,7 @@ impl WatchService {
     pub(crate) async fn run(self: Arc<Self>) -> Result<(), RuntimeError> {
         let mut interval = tokio::time::interval(EVALUATION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let _live_attempt_cleanup = LiveAttemptCleanup(Arc::clone(&self));
         let mut actions = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -543,9 +553,16 @@ impl WatchService {
         if self.is_fatal() {
             return Err(RuntimeError::Fatal);
         }
+        let live_attempt = (
+            reserved.firing.id.clone(),
+            reserved.firing.attempts_reserved,
+        );
+        if !state.live_attempts.contains(&live_attempt) {
+            return Ok(());
+        }
         let result = Self::finish_locked(&mut state, reserved, accepted, clock);
         if result.is_ok() {
-            state.live_attempts.remove(&reserved.firing.id);
+            state.live_attempts.remove(&live_attempt);
         } else {
             self.signal_fatal();
         }
@@ -1276,6 +1293,44 @@ mod tests {
     ) -> StatusCode {
         accepted.send(()).unwrap();
         std::future::pending().await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_supervisor_releases_live_attempt_for_recovery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/action", post(hold_connection))
+            .with_state(accepted_tx);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = directory();
+        let path = dir.join("state.json");
+        let mut service =
+            WatchService::open_at(&path, &[watch(&format!("http://{address}/action"))], 0, 0)
+                .unwrap();
+        Arc::get_mut(&mut service).unwrap().monotonic_origin = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
+        let runner = Arc::clone(&service);
+        let run = tokio::spawn(async move { runner.run().await });
+
+        accepted_rx
+            .recv()
+            .await
+            .expect("first live attempt started");
+        run.abort();
+        let _ = run.await;
+        let retry = service
+            .step_at(1_000_000)
+            .unwrap()
+            .expect("a cancelled live task becomes recoverable after its boundary");
+        assert_eq!(retry.firing.attempts_reserved, 2);
+
+        server.abort();
+        let _ = server.await;
+        drop(service);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test(start_paused = true)]
