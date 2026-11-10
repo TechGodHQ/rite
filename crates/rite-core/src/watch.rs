@@ -391,8 +391,8 @@ impl FiringRecord {
         sequence: u64,
         high_water_utc_ms: i64,
     ) -> Result<(), WatchError> {
-        if self.sequence == 0
-            || self.sequence > sequence
+        if sequence == 0
+            || self.sequence != sequence
             || self.id != format!("{name}:{}", self.sequence)
             || !supported_utc_millis(self.created_at_utc_ms)
             || self.created_at_utc_ms > high_water_utc_ms
@@ -1046,6 +1046,21 @@ mod tests {
         assert_eq!(outcome.result, TerminalResult::Accepted);
         assert!(outcome.uncertain);
         assert_eq!(outcome.attempts_reserved, 2);
+    }
+
+    #[test]
+    fn pending_firing_sequence_must_match_the_watch_sequence() {
+        let mut pending = record();
+        due_firing(&mut pending);
+        pending.reserve_attempt(60_000).unwrap();
+        pending.sequence = 2;
+        let file = WatchFile {
+            version: WATCH_STATE_VERSION,
+            high_water_utc_ms: 60_000,
+            written_at_utc_ms: 60_000,
+            watches: BTreeMap::from([("watch".into(), pending)]),
+        };
+        assert!(matches!(file.validate(), Err(WatchError::InvalidRecord)));
     }
 
     #[test]
