@@ -161,7 +161,13 @@ impl WatchRecord {
             pending.validate(name, self.sequence, high_water_utc_ms)?;
         }
         if let Some(outcome) = &self.last_outcome {
-            outcome.validate(self.sequence, high_water_utc_ms)?;
+            outcome.validate(
+                name,
+                self.sequence,
+                self.pending.as_ref().map(|pending| pending.sequence),
+                self.last_fired_utc_ms,
+                high_water_utc_ms,
+            )?;
         }
         Ok(())
     }
@@ -401,6 +407,7 @@ impl FiringRecord {
             || self.event.event_type != "deadline_exceeded"
             || self.event.action.is_some()
             || self.event.severity != Severity::Warning
+            || self.event.title != format!("Watch {name} deadline exceeded")
             || self.event.body.is_some()
             || self.event.metadata.len() != 2
             || self.event.metadata.get("watch_name") != Some(&json!(name))
@@ -413,7 +420,9 @@ impl FiringRecord {
         }
         match self.phase {
             AttemptPhase::Ready { eligible_utc_ms }
-                if self.attempts_reserved == 0 && eligible_utc_ms == self.created_at_utc_ms =>
+                if self.attempts_reserved == 0
+                    && !self.uncertain
+                    && eligible_utc_ms == self.created_at_utc_ms =>
             {
                 Ok(())
             }
@@ -421,6 +430,7 @@ impl FiringRecord {
                 reserved_at_utc_ms,
                 recovery_at_utc_ms,
             } if self.attempts_reserved > 0
+                && (self.attempts_reserved == 1 || self.uncertain)
                 && reserved_at_utc_ms >= self.created_at_utc_ms
                 && reserved_at_utc_ms <= high_water_utc_ms
                 && expected_crash_recovery_at(reserved_at_utc_ms, self.attempts_reserved)?
@@ -432,6 +442,7 @@ impl FiringRecord {
                 outcome_at_utc_ms,
                 retry_at_utc_ms,
             } if (1..MAX_ATTEMPTS).contains(&self.attempts_reserved)
+                && self.uncertain
                 && outcome_at_utc_ms >= self.created_at_utc_ms
                 && outcome_at_utc_ms <= high_water_utc_ms
                 && outcome_at_utc_ms.checked_add(
@@ -501,15 +512,34 @@ pub struct TerminalOutcome {
 }
 
 impl TerminalOutcome {
-    fn validate(&self, sequence: u64, high_water_utc_ms: i64) -> Result<(), WatchError> {
+    fn validate(
+        &self,
+        name: &str,
+        sequence: u64,
+        pending_sequence: Option<u64>,
+        last_fired_utc_ms: Option<i64>,
+        high_water_utc_ms: i64,
+    ) -> Result<(), WatchError> {
+        let attempt_state_valid = match self.result {
+            TerminalResult::Accepted => {
+                (1..=MAX_ATTEMPTS).contains(&self.attempts_reserved)
+                    && self.uncertain == (self.attempts_reserved > 1)
+            }
+            TerminalResult::RetryExhausted => {
+                self.attempts_reserved == MAX_ATTEMPTS && self.uncertain
+            }
+            TerminalResult::Removed => self.uncertain == (self.attempts_reserved > 0),
+        };
         if self.sequence == 0
             || self.sequence > sequence
+            || self.firing_id != format!("{name}:{}", self.sequence)
+            || pending_sequence == Some(self.sequence)
             || !supported_utc_millis(self.finished_at_utc_ms)
             || self.finished_at_utc_ms > high_water_utc_ms
-            || self.attempts_reserved > MAX_ATTEMPTS
-            || (self.result == TerminalResult::Accepted && self.attempts_reserved == 0)
-            || (self.result == TerminalResult::RetryExhausted
-                && self.attempts_reserved != MAX_ATTEMPTS)
+            || (self.sequence == sequence
+                && last_fired_utc_ms
+                    .is_none_or(|last_fired_utc_ms| self.finished_at_utc_ms < last_fired_utc_ms))
+            || !attempt_state_valid
         {
             return Err(WatchError::InvalidRecord);
         }
@@ -1061,6 +1091,91 @@ mod tests {
             watches: BTreeMap::from([("watch".into(), pending)]),
         };
         assert!(matches!(file.validate(), Err(WatchError::InvalidRecord)));
+    }
+
+    #[test]
+    fn pending_synthetic_event_title_must_be_canonical() {
+        let mut pending = record();
+        due_firing(&mut pending);
+        pending.pending.as_mut().unwrap().event.title = "untrusted title".into();
+        let file = WatchFile {
+            version: WATCH_STATE_VERSION,
+            high_water_utc_ms: 60_000,
+            written_at_utc_ms: 60_000,
+            watches: BTreeMap::from([("watch".into(), pending)]),
+        };
+        assert!(matches!(file.validate(), Err(WatchError::InvalidRecord)));
+    }
+
+    #[test]
+    fn terminal_outcome_identity_and_attempt_uncertainty_must_be_consistent() {
+        let mut accepted = record();
+        due_firing(&mut accepted);
+        accepted.reserve_attempt(60_000).unwrap();
+        accepted.complete_attempt(61_000, true).unwrap();
+        let file = WatchFile {
+            version: WATCH_STATE_VERSION,
+            high_water_utc_ms: 61_000,
+            written_at_utc_ms: 61_000,
+            watches: BTreeMap::from([("watch".into(), accepted.clone())]),
+        };
+        file.validate().expect("canonical accepted result is valid");
+
+        let mut mismatched_identity = accepted.clone();
+        mismatched_identity.last_outcome.as_mut().unwrap().firing_id = "other-watch:1".into();
+        let mut mismatched_uncertainty = accepted.clone();
+        mismatched_uncertainty
+            .last_outcome
+            .as_mut()
+            .unwrap()
+            .uncertain = true;
+        let invalid_files = [mismatched_identity, mismatched_uncertainty].map(|record| WatchFile {
+            version: WATCH_STATE_VERSION,
+            high_water_utc_ms: 61_000,
+            written_at_utc_ms: 61_000,
+            watches: BTreeMap::from([("watch".into(), record)]),
+        });
+        for invalid in invalid_files {
+            assert!(matches!(invalid.validate(), Err(WatchError::InvalidRecord)));
+        }
+    }
+
+    #[test]
+    fn terminal_result_attempt_and_uncertainty_combinations_are_validated() {
+        let mut removed = record();
+        due_firing(&mut removed);
+        removed.reserve_attempt(60_000).unwrap();
+        removed.remove_with_pending(61_000).unwrap();
+        let valid_removed = WatchFile {
+            version: WATCH_STATE_VERSION,
+            high_water_utc_ms: 61_000,
+            written_at_utc_ms: 61_000,
+            watches: BTreeMap::from([("watch".into(), removed.clone())]),
+        };
+        valid_removed
+            .validate()
+            .expect("removed attempted firing retains uncertainty");
+
+        let mut removed_without_uncertainty = removed.clone();
+        removed_without_uncertainty
+            .last_outcome
+            .as_mut()
+            .unwrap()
+            .uncertain = false;
+        let mut false_exhaustion = removed;
+        let outcome = false_exhaustion.last_outcome.as_mut().unwrap();
+        outcome.result = TerminalResult::RetryExhausted;
+        outcome.attempts_reserved = 1;
+        let invalid_files =
+            [removed_without_uncertainty, false_exhaustion].map(|record| WatchFile {
+                version: WATCH_STATE_VERSION,
+                high_water_utc_ms: 61_000,
+                written_at_utc_ms: 61_000,
+                watches: BTreeMap::from([("watch".into(), record)]),
+            });
+        for invalid in invalid_files {
+            assert!(matches!(invalid.validate(), Err(WatchError::InvalidRecord)));
+        }
     }
 
     #[test]

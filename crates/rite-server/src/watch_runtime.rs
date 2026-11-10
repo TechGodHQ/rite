@@ -148,15 +148,22 @@ impl WatchService {
         config: &RiteConfigView<'_>,
         dispatch_gate: Arc<ActionDispatchGate>,
     ) -> Result<Option<Arc<Self>>, RuntimeError> {
-        if config.watches.is_empty() {
+        if config.watches.is_empty() && config.state_path.is_none() {
             return Ok(None);
         }
         let path = config.state_path.ok_or(RuntimeError::InvalidState)?;
-        Self::open_inner(path, config.watches, dispatch_gate, || {
+        let service = Self::open_inner(path, config.watches, dispatch_gate, || {
             let host_utc_ms = system_utc_millis().ok_or(RuntimeError::RecoveryTimeUnavailable)?;
             Ok((host_utc_ms, 0, Instant::now()))
-        })
-        .map(Some)
+        })?;
+        if config.watches.is_empty() {
+            // Reconcile retained durable records even after the last watch is
+            // removed, then release the lock instead of supervising an idle service.
+            drop(service);
+            Ok(None)
+        } else {
+            Ok(Some(service))
+        }
     }
 
     #[cfg(test)]
@@ -1045,6 +1052,51 @@ mod tests {
     }
 
     #[test]
+    fn removing_the_last_watch_commits_removal_before_a_later_readd() {
+        let dir = directory();
+        let path = dir.join("state.json");
+        let original = watch("http://127.0.0.1:9/action");
+        let service = WatchService::open_at(&path, std::slice::from_ref(&original), 0, 0).unwrap();
+        assert!(service.step_at(60_000).unwrap().is_some());
+        drop(service);
+
+        let no_watches = [];
+        let config = RiteConfigView {
+            watches: &no_watches,
+            state_path: Some(&path),
+        };
+        assert!(
+            WatchService::open(&config, Arc::new(ActionDispatchGate::default()))
+                .unwrap()
+                .is_none()
+        );
+
+        let removed: WatchFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let record = &removed.watches["watch-a"];
+        assert!(record.pending.is_none());
+        let outcome = record.last_outcome.as_ref().unwrap();
+        assert_eq!(outcome.result, TerminalResult::Removed);
+        assert!(outcome.uncertain);
+
+        let readded = WatchService::open_at(
+            &path,
+            std::slice::from_ref(&original),
+            removed.high_water_utc_ms,
+            0,
+        )
+        .unwrap();
+        let readded_record = &readded.snapshot().unwrap().watches["watch-a"];
+        assert!(readded_record.pending.is_none());
+        assert_eq!(
+            readded_record.last_outcome.as_ref().unwrap().result,
+            TerminalResult::Removed
+        );
+
+        drop(readded);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn concurrent_heartbeats_sample_clocks_in_durable_lock_order() {
         const WORKERS: usize = 24;
         let dir = directory();
@@ -1371,7 +1423,32 @@ mod tests {
                 .unwrap()
                 .uncertain
         );
-        let retry = service
+        let on_disk: WatchFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            on_disk.watches["watch-a"]
+                .pending
+                .as_ref()
+                .unwrap()
+                .uncertain,
+            "cancellation uncertainty must be persisted before releasing the lock"
+        );
+        drop(service);
+        let reopened = WatchService::open_at(
+            &path,
+            &[watch(&format!("http://{address}/action"))],
+            on_disk.high_water_utc_ms,
+            0,
+        )
+        .unwrap();
+        assert!(
+            reopened.snapshot().unwrap().watches["watch-a"]
+                .pending
+                .as_ref()
+                .unwrap()
+                .uncertain,
+            "uncertainty must survive a durable close and reopen"
+        );
+        let retry = reopened
             .step_at(1_000_000)
             .unwrap()
             .expect("a cancelled live task becomes recoverable after its boundary");
@@ -1379,7 +1456,7 @@ mod tests {
 
         server.abort();
         let _ = server.await;
-        drop(service);
+        drop(reopened);
         fs::remove_dir_all(dir).unwrap();
     }
 
